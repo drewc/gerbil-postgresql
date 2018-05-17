@@ -1,0 +1,97 @@
+#+TITLE: The Password File
+
+"The file .pgpass be used if the connection requires a password (and
+no password has been specified otherwise)." 
+--https://www.postgresql.org/docs/current/static/libpq-pgpass.html
+
+
+* Location
+
+#+BEGIN_QUOTE
+The file .pgpass in a user's home directory can contain passwords to
+be used if the connection requires a password (and no password has
+been specified otherwise). 
+
+On Microsoft Windows the file is named
+%APPDATA%\postgresql\pgpass.conf (where %APPDATA% refers to the
+Application Data subdirectory in the user's profile). 
+
+Alternatively, a password file can be specified using the connection
+parameter passfile or the environment variable PGPASSFILE.
+
+--https://www.postgresql.org/docs/current/static/libpq-pgpass.html
+#+END_QUOTE
+
+#+NAME: find-pgpass-file
+#+BEGIN_SRC scheme
+  (def (find-pgpass-file)
+    "=> filename-as-string OR #f"
+    (let ((path (or (getenv "PGPASSFILE" #f)
+		    (string-append (getenv "HOME") "/.pgpass"))))
+      (if (file-exists? path)
+	path
+	#f)))
+#+END_SRC
+
+
+#+BEGIN_QUOTE
+This file should contain lines of the following format:
+
+hostname:port:database:username:password
+
+#+END_QUOTE
+#+NAME: defstruct-pgpass
+#+BEGIN_SRC scheme
+(defstruct pgpass
+  (hostname port database username password))
+#+END_SRC
+
+#+BEGIN_QUOTE
+(You can add a reminder comment to the file by copying the line above
+and preceding it with #.) Each of the first four fields can be a
+literal value, or *, which matches anything. The password field from
+the first line that matches the current connection parameters will be
+used. (Therefore, put more-specific entries first when you are using
+wildcards.) If an entry needs to contain : or \, escape this character
+with \. A host name of localhost matches both TCP (host name
+localhost) and Unix domain socket (pghost empty or the default socket
+directory) connections coming from the local machine. In a standby
+server, a database name of replication matches streaming replication
+connections made to the master server. The database field is of
+limited usefulness because users have the same password for all
+databases in the same cluster.
+#+END_QUOTE
+
+#+NAME: read-pgpass-file
+#+BEGIN_SRC scheme
+  (def (read-pgpass-file (filename (find-pgpass-file)))
+   (def (read-lines port)
+     (let ((line (read-line port)))
+       (if (eof-object? line)
+	 '()
+	 (if (char=? (string-ref line 0) #\#)
+	   (read-lines port)
+	   (cons line (read-lines port))))))
+
+   (def (read-pgpass-line-from-string string)
+     (let ((list (pregexp-split "(?<!\\\\):" string)))
+       (apply make-pgpass (map (lambda (s) (pregexp-replace* "\\\\" s "")) list))))
+ 
+   (if (file-exists? filename)
+     (map read-pgpass-line-from-string
+	  (call-with-input-file filename read-lines))
+     #f))
+#+END_SRC
+
+* File: pgpass.ss
+
+#+BEGIN_SRC scheme :noweb yes :tangle "../pgpass.ss"
+(import :std/pregexp)
+(export #t)
+
+<<find-pgpass-file>>
+
+<<defstruct-pgpass>>
+
+<<read-pgpass-file>>
+#+END_SRC
