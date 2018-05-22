@@ -1,0 +1,21 @@
+gerbil-postgresql : A Gerbil Package for interacting with the Postgresql database system
+
+
+* Introduction 
+
+We use gerbil, gerbil has a postgresql dbi. We interact with
+postgresql and gerbil.
+
+* Usage 
+
+
+Pgpass to the rescue! [[file:doc/pgpass.org][See here for details]]. 
+
+#+BEGIN_SRC scheme
+(import :drewc/postgresql/pgpass)
+
+(find-password user: "foobar")
+;; => "ecm- colon : backslash \\ a1sd"
+#+END_SRC
+
+
