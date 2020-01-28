@@ -8,14 +8,27 @@ postgresql and gerbil.
 
 * Usage 
 
+We want to connect to a database. We want to use an external file to
+store password information.  Pgpass to the rescue! [[file:doc/pgpass.org][See here for
+details]].
 
-Pgpass to the rescue! [[file:doc/pgpass.org][See here for details]]. 
+#+BEGIN_SRC gerbil 
+  (import :drewc/postgresql/pgpass)
 
-#+BEGIN_SRC scheme
-(import :drewc/postgresql/pgpass)
-
-(find-password user: "foobar")
-;; => "ecm- colon : backslash \\ a1sd"
+  (find-password user: "foobar")
+  ;; => "ecm- colon : backslash \\ a1sd"
 #+END_SRC
+
+In reality, we do not want to find the password every time, we want it
+automated. [[file:doc/connect.org][~connect~]] , using pgass!
+
+#+BEGIN_SRC gerbil 
+  (import :drewc/postgresql/connect)
+
+  (connect user: "ecm" port: 5434)
+  ;; => #<postgresql-connection #30>
+#+END_SRC
+
+
 
 
