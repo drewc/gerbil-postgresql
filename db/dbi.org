@@ -1,3 +1,28 @@
+#+TITLE: Generic SQL Database Interface
+
+This is the literate implementation. The documentation (and hopefully tests) are
+[[file:~/me/src/gerbil-postgresql/doc/db.org::#generic-database-interface][here]].
+
+
+* Connection
+:PROPERTIES:
+:CUSTOM_ID: connectionStruct
+:END:
+
+We need to connect to a database. This is the superstruct, which is exported.
+
+#+begin_src scheme :noweb-ref defstruct connection
+(defstruct connection (e txn-begin txn-commit txn-abort)
+  constructor: :init!)
+
+(defmethod {:init! connection}
+  (lambda (self e)
+    (struct-instance-init! self e)))
+#+end_src
+
+
+
+#+begin_src scheme :tangle dbi.ss :noweb yes
 ;;; -*- Gerbil -*-
 ;;; (C) vyzo
 ;;; Generic SQL database interface
@@ -17,14 +42,11 @@
   sql-exec sql-query in-sql-query sql-columns
   sql-txn-begin sql-txn-commit sql-txn-abort)
 
+<<defstruct connection>>
 
-(defstruct connection (e txn-begin txn-commit txn-abort)
-  constructor: :init!)
 (defstruct statement (e))
 
-(defmethod {:init! connection}
-  (lambda (self e)
-    (struct-instance-init! self e)))
+
 
 (defstruct (sql-error <error>) ())
 
@@ -167,3 +189,4 @@
   (if (statement-e stmt)
     {columns stmt}
     (error "Invalid operation; statement finalized" stmt)))
+#+end_src

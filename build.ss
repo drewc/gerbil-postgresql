@@ -4,4 +4,4 @@
 (import :std/build-script)
 
 (defbuild-script
-  '("pgpass" "postgresql-driver" "postgresql" "connect"))
+  '("db/postgresql-driver" "db/postgresql" "db/dbi"))

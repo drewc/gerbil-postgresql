@@ -1,4 +1,4 @@
-gerbil-postgresql : A Gerbil Package for interacting with the Postgresql database system
+#+TITLE: A Gerbil Package for PostgreSQL
 
 
 * Introduction 

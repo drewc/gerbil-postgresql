@@ -1,0 +1,63 @@
+#+TITLE: Gerbil: The real meta-scheme
+
+* The Package file
+
+#+begin_src scheme :tangle gerbil.pkg
+(package: drewc)
+#+end_src
+
+* The build file
+
+#+begin_src scheme :tangle build.ss :shebang #!/usr/bin/env gxi
+;; -*- Gerbil -*-
+
+(import :std/build-script)
+
+(defbuild-script
+  '("db/postgresql-driver" "db/postgresql" "db/dbi"))
+
+#+end_src
+
+#+begin_src text :noweb-ref "do spaces work wot"
+huh
+#+end_src
+
+#+begin_src text :noweb yes
+Test <<do spaces work wot>>
+#+end_src
+* The db/ subtree
+
+** Clone the upstream repo
+
+#+begin_src shell
+cd ~/me/src
+git clone git@github.com:vyzo/gerbil.git
+#+end_src
+
+** Split subtrees
+
+#+begin_src shell
+cd gerbil;
+git subtree split --prefix=src/std/db --branch=pgdb-subtree
+#+end_src
+
+** Keep only postgres and dbi
+
+#+begin_src shell
+find * -not -name 'postgresql*' -not -name 'dbi*' -exec git rm {} \;
+git commit -m "There can be only one"
+#+end_src
+
+** Add the subtree
+
+#+begin_src shell
+cd ~/me/src/gerbil-postgresql
+git subtree add --prefix db ../gerbil/ pgdb-subtree --squash
+#+end_src
+
+** pull the subtree
+
+#+begin_src shell
+cd ~/me/src/gerbil-postgresql
+git subtree pull --prefix db ../gerbil/ pgdb-subtree --squash
+#+end_src

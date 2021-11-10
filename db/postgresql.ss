@@ -1,9 +1,9 @@
 ;;; -*- Gerbil -*-
-;;; (C) vyzo
+;;; (C) drewc, vyzo
 ;;; PostgreSQL dbi interface
 
-(import :std/db/dbi
-        :std/db/postgresql-driver
+(import :drewc/db/dbi
+        :drewc/db/postgresql-driver
         :std/iter
         :std/misc/channel
         :std/srfi/19)
@@ -15,6 +15,98 @@
 
 (defstruct (postgresql-connection connection) ()
   final: #t)
+
+(defstruct (postgresql-query statement) (conn str stmts inp token)
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! postgresql-query}
+  (lambda (self conn str)
+    (struct-instance-init! self (eof-object) conn str)))
+
+(def (statements<-query query)
+  (def stmts [])
+  (def stmt-cols postgresql-message-args)
+  (with ((postgresql-query _ conn _ _ inp token) query)
+    (let next ()
+      (def tok (channel-get inp))
+      (def out (make-channel))
+      (unless (eof-object? tok)
+        (let ((stmt (make-postgresql-statement
+                     (eof-object) conn #f (stmt-cols tok))))
+         (set! (postgresql-statement-token stmt) token)
+         (set! (postgresql-statement-row stmt) #f)
+         (let lp ()
+           (def row (channel-get inp))
+           (cond
+            ((eof-object? row)
+             (set! (postgresql-statement-inp stmt) out)
+             (set! stmts [stmt stmts ...])
+             (next))
+            ((query-token? row)
+              (postgresql-continue! conn row)
+              (lp))
+            (else
+             (channel-put out row)
+                  (lp))))))
+      )
+    (reverse stmts)))
+
+ (defmethod {query-start postgresql-query}
+  (lambda (self)
+    (def stmt-cols postgresql-message-args)
+    (with ((postgresql-query _ conn str) self)
+      (let ((values inp token) (postgresql-simple-query! conn str))
+        (set! (postgresql-query-token self) token)
+        (set! (postgresql-query-inp self) inp)
+        (set! (postgresql-query-stmts self) (statements<-query self))))))
+
+#;(defmethod {query-start postgresql-query}
+  (lambda (self)
+    (def stmt-cols RowDescription-fields)
+    (with ((postgresql-query _ conn str) self)
+      (let* (((values inp token) (postgresql-simple-query! conn str))
+             (stmt (make-postgresql-statement
+                    #f conn #f (stmt-cols (channel-get inp)))))
+        (set! (postgresql-statement-token stmt) token)
+        (set! (postgresql-query-token self) token)
+        (set! (postgresql-statement-inp stmt) inp)
+        (set! (postgresql-query-inp self) inp)
+        (set! (postgresql-statement-row stmt) #f)
+        (set! (postgresql-query-stmts self) [stmt])))))
+
+(defmethod {query-fetch postgresql-query}
+  (lambda (self)
+    (def stmt-cols postgresql-message-args)
+    (let* ((stmt (car (postgresql-query-stmts self)))
+           (inp (postgresql-statement-inp stmt))
+           (val {query-fetch stmt}))
+      (if (iter-end? val)
+        (let* ((rd? (channel-get inp)))
+          (if (eof-object? rd?) iter-end
+              (let* ((conn (postgresql-query-conn self))
+                     (token (postgresql-query-token self))
+                     (stmt (make-postgresql-statement
+                            #f conn #f (stmt-cols rd?))))
+                (set! (postgresql-statement-token stmt) token)
+                (set! (postgresql-statement-inp stmt) inp)
+                (set! (postgresql-statement-row stmt) #f)
+                (set! (postgresql-query-stmts self)
+                  [stmt (postgresql-query-stmts self) ...])
+                {query-fetch self})))
+        val))))
+
+(defmethod {query-row postgresql-query}
+  (lambda (self)
+    (postgresql-statement-row (car (postgresql-query-stmts self)))))
+
+
+(defmethod {columns postgresql-query}
+  (lambda (self)
+    (def stmt-cols postgresql-message-args)
+    (map car (postgresql-statement-cols (car (postgresql-query-stmts self))))))
+
+
 (defstruct (postgresql-statement statement) (conn params cols bind row inp token)
   constructor: :init!
   final: #t)

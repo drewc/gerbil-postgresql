@@ -1,53 +1,235 @@
-;;; -*- Gerbil -*-
-;;; (C) vyzo
-;;; PostgreSQL driver
+#+TITLE: Postgresql
 
-(import :gerbil/gambit/threads
-        :gerbil/gambit/ports
-        :gerbil/gambit/bits
-        :std/actor/proto
+https://www.postgresql.org/docs/13/protocol-message-formats.html
+
+* Add "simple query"
+
+Here's the thing. Postgresql can take a string that has mulitple statements as a
+single query.
+
+#+begin_quote
+The response to a SELECT query (or other queries that return row sets, such as
+EXPLAIN or SHOW) normally consists of RowDescription, zero or more DataRow
+messages, and then CommandComplete. [...]
+
+Since a query string could contain several queries (separated by semicolons),
+there might be several such response sequences before the backend finishes
+processing the query string. ReadyForQuery is issued when the entire string has
+been processed and the backend is ready to accept a new query string.
+#+end_quote
+
+In the driver it is this.
+
+#+begin_src scheme :noweb-ref postgresql-simple-query
+(def (postgresql-simple-query! conn str)
+  (with-driver conn driver
+    (!!postgresql.simple-query driver str)))
+#+end_src
+
+** Getting Started
+*** Connect to a server
+
+Let's connect to a local server.
+
+#+begin_src scheme
+(import :drewc/db/postgresql-driver :drewc/db/postgresql-driver
+        :drewc/db/dbi)
+
+(def conn (postgresql-connect! "localhost" 5432 "test" "test" #f))
+#+end_src
+
+We need to access the socket directly to hack away without a constant recompilation.
+
+#+begin_src scheme
+(def sock (postgresql-socket conn))
+#+end_src
+
+*** Send the ~Query~ message
+
+We send messages using [[#postgresqlSend][~postgresql-send!~]].
+
+#+begin_src scheme
+(extern namespace: "drewc/db/postgresql-driver" postgresql-send!)
+(def (send! msg) (postgresql-send! sock msg))
+#+end_src
+
+https://www.postgresql.org/docs/13/protocol-flow.html#id-1.10.5.7.4
+
+- Query (F) :: The (F) means it a [[#frontEndMessages][Front End Message]]
+  - Byte1('Q') :: Identifies the message as a simple query.
+  - Int32 :: Length of message contents in bytes, including self.
+  - String :: The query string itself.
+
+The ~postgresql-send!~ procedure takes care of the byte and length for us.
+
+The *Front End Message* takes care of the marshalling.
+
+#+begin_src scheme
+  (Query                    #\Q  marshal-query)
+#+end_src
+
+So that means that all we need is to send the query.
+
+#+begin_src scheme
+(send! ['Query "SELECT 42 \"is the answer\",
+                ' to life, the universe, ' \"and everything\""])
+#+end_src
+
+**** ~marshall-query~
+
+#+begin_src scheme
+(def (marshal-query body)
+  (with ([sql] body)
+    (let (bio (open-serializer-output-buffer))
+      (marshal-string sql bio)
+      bio)))
+#+end_src
+
+*** Receive the Reponse
+
+According to the docs a select will first return a ~RowDescription~.
+
+#+begin_src scheme
+(extern namespace: "drewc/db/postgresql-driver" postgresql-recv!)
+(import :std/logger)
+
+(def buffer (box (make-u8vector 1024)))
+
+(def (recv!)
+    (match (postgresql-recv! sock buffer)
+      (['NoticeResponse msg . irritants]
+       (notice! msg irritants)
+       (recv!))
+      (msg msg)))
+
+  (def (notice! msg irritants)
+    (warnf "NOTICE: ~a ~a" msg irritants))
+#+end_src
+
+Lets see!
+
+#+begin_src scheme
+(def stmt-data (list (recv!) (recv!)))
+
+;;> stmt-data
+;;=>
+;; ((RowDescription ("is the answer" 0 0 23 4 -1 0)
+;;                  ("and everything" 0 0 25 -1 -1 0))
+;;  (DataRow "42" " to life, the universe, "))
+#+end_src
+
+Now if luck would have it we get CommandComplete and ReadyForQuery.
+
+#+begin_src scheme
+(list (recv!) (recv!))
+  =>
+ ((CommandComplete "SELECT 1") (RowDescription ("?column?" 0 0 23 4 -1 0)))
+#+end_src
+
+That's awesomesauce! We'll use that to create a simple query.
+
+
+** Start Simple Query in the Driver
+
+There are some local "globals" in the driver that map the driver's path.
+
+#+begin_src scheme
+(import :std/actor/proto
         :std/actor/message
         :std/misc/channel
-        :std/misc/list
-        :std/net/bio
-        :std/net/sasl
-        :std/text/utf8
-        :std/text/hex
-        :std/crypto
-        :std/logger
-        :std/sugar
-        :std/error
-        :drewc/db/dbi)
-(export postgresql-connect!
-        postgresql-prepare-statement!
-        postgresql-close-statement!
-        postgresql-exec!
-        postgresql-query!
-        postgresql-simple-query!
-        postgresql-continue!
-        postgresql-reset!
-        postgresql-close!
-        postgresql-socket
-        postgresql-message
-        postgresql-message-name
-        postgresql-message-args
-        postgresql-RowDescription?
-        (rename: !token? query-token?))
+        :std/misc/list)
+(def query-limit 1000)
+(def query-output #f)
+(def query-token #f)
+(def simple-query #f)
+#+end_src
 
-(deflogger postgres)
+*** Sync, maybe, and ~resync!~
 
-;;; driver interface
-(defproto postgresql
-  (prepare name sql)
-  (exec name params)
-  (query name params)
-  (simple-query str)
-  event:
-  (continue token)
-  (reset token)
-  (close name)
-  (shutdown))
+The local global use! Essentially, if we are within a query either want to
+ignore the rest or are simply done we can wait for a ~ReadyForQuery~ response.
 
+#+begin_src scheme
+(def (resync!)
+    (let lp ()
+      (match (recv!)
+        (['ReadyForQuery _]
+         (void))
+        (else
+         (lp)))))
+
+(def (maybe-sync!)
+  (when query-output
+    (channel-sync query-output (make-sql-error "portal expired" [] 'postgresql-query-pump!))
+    (channel-close query-output)
+    (set! query-output #f)
+    (set! query-token #f)
+    (set! simple-query #f)
+    (resync!)
+    (let (to-close deferred-close)
+      (set! deferred-close [])
+      (for-each close to-close))))
+#+end_src
+
+*** Simple Query Start
+
+To start with with ~send!~ the query, make a unique token, and mention this is a simple query (possibly?).
+
+#+begin_src scheme :noweb-ref simple-query-start
+(def (simple-query-start str)
+    (send! ['Query str])
+    (let ((ch (make-channel query-limit))
+             (token (make-!token)))
+         (set! query-output ch)
+         (set! query-token token)
+         (set! simple-query #t)
+         (values ch token)))
+#+end_src
+
+** Simple Query Pump: pass along the results
+
+#+begin_quote
+A simple query cycle is initiated by the frontend sending a Query message to the backend. The message includes an SQL command (or commands) expressed as a text string.
+
+The possible response messages from the backend are:
+
+CommandComplete
+An SQL command completed normally.
+
+CopyInResponse
+The backend is ready to copy data from the frontend to a table; see Section 53.2.5.
+
+CopyOutResponse
+The backend is ready to copy data from a table to the frontend; see Section 53.2.5.
+
+RowDescription
+Indicates that rows are about to be returned in response to a SELECT, FETCH, etc query. The contents of this message describe the column layout of the rows. This will be followed by a DataRow message for each row being returned to the frontend.
+
+DataRow
+One of the set of rows returned by a SELECT, FETCH, etc query.
+
+EmptyQueryResponse
+An empty query string was recognized.
+
+ErrorResponse
+An error has occurred.
+
+ReadyForQuery
+Processing of the query string is complete. A separate message is sent to indicate this because the query string might contain multiple SQL commands. (CommandComplete marks the end of processing one SQL command, not the whole string.) ReadyForQuery will always be sent, whether processing terminates successfully or with an error.
+
+NoticeResponse
+A warning message has been issued in relation to the query. Notices are in addition to other responses, i.e., the backend will continue processing the command.
+
+-- https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
+
+
+#+end_quote
+
+Ok! So a query and then the result is returned until ~ReadyForQuery~.
+
+We do not really care about the results beyond passing them up to those that do.
+
+#+begin_src scheme :noweb-ref postgresql-message
 (defstruct postgresql-message (name args)
   print: (args))
 (defstruct (postgresql-RowDescription postgresql-message) ()
@@ -62,72 +244,253 @@
 (defmethod {:init! postgresql-CommandComplete}
   (lambda (self desc)
     (struct-instance-init! self 'CommandComplete desc)))
+#+end_src
 
-(defrules with-driver ()
-  ((_ conn driver body ...)
-   (cond
-    ((thread? conn)
-     (let (driver conn)
-       body ...))
-    ((connection-e conn)
-     => (lambda (driver) body ...))
-    (else
-     (error "connection has been closed" conn)))))
+*** ~simple-query-pump~
+The only thing that makes this "special" is the ~query-limit~. When we reach the
+limit the pump stops running until signalled to run again. This is essentially
+so we can iteratate over a tonne a rows without needing them all in memory.
 
-(defrules get-driver ()
-  ((_ conn)
-   (if (thread? conn) conn (connection-e conn))))
+#+begin_src scheme :noweb-ref simple-query-pump
+(def (simple-query-pump)
+  (let/cc break
+    (let lp ()
+      (let ((r (recv!)))
+        (match r
+          (['RowDescription . fields]
+           (channel-sync query-output (postgresql-RowDescription fields))
+           (lp))
+          (['CommandComplete tag]
+           (channel-sync query-output (postgresql-CommandComplete tag))
+           (lp))
+          (['DataRow . cols]
+           (cond                                            ;
+            ((channel-try-put query-output cols)            ;
+             (lp))                                          ;
+            (else                                           ;
+             (channel-sync query-output cols query-token)   ;
+             (break))))
+          (['ReadyForQuery _]
+           (channel-sync query-output (eof-object)))  ;
+          (['EmptyQueryResponse]
+           (lp))
+          (['ErrorResponse msg . irritants]
+           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!))
+           (lp)))))
+    (channel-close query-output)
+    (set! query-output #f)
+    (set! query-token #f)
+    (set! simple-query #f)))
+#+end_src
 
+*** Test out the pump
+
+Start a query with 3 different commands.
+
+#+begin_src scheme
+(defvalues (inp token)
+            (simple-query-start "
+BEGIN;
+CREATE TEMP TABLE test_tbl
+  AS SELECT tablename FROM pg_tables WHERE schemaname = 'pg_catalog';
+SELECT count(*) FROM test_tbl ;
+SELECT * from test_tbl LIMIT 2;
+ABORT;"))
+
+(def msgs (begin (simple-query-pump) (for/collect (msg (:iter inp)) msg)))
+
+#+end_src
+
+We can see what we output.
+
+#+begin_src scheme
+(user)> (pretty-print msgs)
+(#<postgresql-CommandComplete #126 args: "BEGIN">
+ #<postgresql-CommandComplete #127 args: "SELECT 62">
+ #<postgresql-RowDescription #128 args: (("count" 0 0 20 8 -1 0))>
+ ("62")
+ #<postgresql-CommandComplete #129 args: "SELECT 1">
+ #<postgresql-RowDescription #130 args: (("tablename" 58396 1 19 64 -1 0))>
+ ("pg_statistic")
+ ("pg_type")
+ #<postgresql-CommandComplete #131 args: "SELECT 2">
+ #<postgresql-CommandComplete #132 args: "ROLLBACK">)
+#!void
+#+end_src
+
+That's awesome! It's enough for the fronted to see what objects to create.
+
+But, what about the limit?
+
+Let's make it shorter lol.
+
+#+begin_src scheme
+(set! query-limit 1)
+(defvalues (inp token)
+            (simple-query-start "
+BEGIN;
+CREATE TEMP TABLE test_tbl
+  AS SELECT tablename FROM pg_tables WHERE schemaname = 'pg_catalog';
+SELECT * from test_tbl LIMIT 5;
+ABORT;"))
+
+(def msgs
+  (begin (simple-query-pump)
+         (let ((msgs []))
+  (let again () (def m (channel-try-get inp))
+    (cond (m (set! msgs [m msgs ...]) (again))
+          (else (reverse msgs)))))))
+#+end_src
+
+What does that give us?
+
+#+begin_src scheme
+(user)> (pretty-print msgs)
+(#<postgresql-CommandComplete #38 args: "BEGIN">
+ #<postgresql-CommandComplete #39 args: "SELECT 62">
+ #<postgresql-RowDescription #40 args: (("tablename" 58464 1 19 64 -1 0))>
+ ("pg_statistic")
+ #<!token #41>)
+#!void
+#+end_src
+
+That ~!token~ means we need to continue as we've reached the limit.
+
+So to continue we need to start pumping again.
+
+The first way is to write a driver function, [[#postgresqlDriverContinue][continue]], which can be integrated
+with the driver.
+
+#+begin_src scheme
+(set! msgs
+  (begin (continue token)
+         (let ((msgs []))
+  (let again () (def m (channel-try-get inp))
+    (cond ((and m (not (eof-object? m))) (set! msgs [m msgs ...]) (again))
+          (else (reverse msgs)))))))
+  (pretty-print msgs)
+
+ ;; => (("pg_type") ("pg_foreign_table") #<!token #59>)
+#+end_src
+
+Twice more?
+#+begin_src scheme
+(set! msgs
+  (begin (postgresql-continue! conn token)
+         (postgresql-continue! conn token)
+         (let ((msgs []))
+  (let again () (def m (channel-try-get inp))
+    (cond ((and m (not (eof-object? m))) (set! msgs [m msgs ...]) (again))
+          (else (reverse msgs)))))))
+
+ ;; => (#<postgresql-CommandComplete #64 args: "SELECT 5">
+ ;;     #<postgresql-CommandComplete #65 args: "ROLLBACK">)
+#+end_src
+
+And we can see that the channel is done and closed, as is the query.
+
+#+begin_src scheme
+(user)> (list (channel-try-get inp) query-token query-output simple-query)
+(#!eof #f #f #f)
+#+end_src
+
+
+** The Front End
+
+We need a connection to our db.
+
+#+begin_src scheme
+  (def conn (postgresql-connect host: "localhost" port: 5432
+                                user: "test" passwd: "test"))
+#+end_src
+
+Now just like the backend we get some input that needs processing.
+
+* ~postgresql-query~ struct
+
+To make it simple we can sub the statement.
+
+#+begin_src scheme
+(defstruct (postgresql-query postgresql-statement) ()
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! postgresql-query}
+  (lambda (self conn str)
+    (struct-instance-init! self #f conn str)))
+
+(defalias postgresql-query-str postgresql-statement-params)
+
+(defmethod {query-start postgresql-query}
+  (lambda (self)
+    (with ((postgresql-query name conn str) self)
+      (let ((values inp token) (postgresql-simple-query! conn str))
+        (set! (postgresql-statement-token self) token)
+        (set! (postgresql-statement-inp self) inp)
+        (set! (postgresql-statement-row self) #f)))))
+#+end_src
+
+
+* Front End
+
+** Connection
+:PROPERTIES:
+:CUSTOM_ID: frontEndConnection
+:END:
+
+We need to connect to a server. Time to sub [[file:dbi.org::#connectionStruct][Connection]].
+
+#+begin_src scheme :noweb-ref postgresql-connection
+(defstruct (postgresql-connection connection) () final: #t)
+
+(def (postgresql-connect host: (host "127.0.0.1")
+                         port: (port 5432)
+                         user: user
+                         passwd: passwd
+                         db: (db #f))
+  (let (driver (postgresql-connect! host port user passwd db))
+    (make-postgresql-connection driver)))
+
+(defmethod {close postgresql-connection}
+  (lambda (self)
+    (postgresql-close! self)))
+#+end_src
+
+
+
+* The Backend Driver
+
+#+begin_quote
+PostgreSQL uses a message-based protocol for communication between frontends and
+backends (clients and servers). The protocol is supported over TCP/IP and also
+over Unix-domain sockets. Port number 5432 has been registered with IANA as the
+customary TCP port number for servers supporting this protocol, but in practice
+any non-privileged port number can be used.
+#+end_quote
+
+That's the sense of it. We have a function that runs in a thread and implements
+the communication protocol. We interact with that protocol and bob's your uncle.
+
+** ~postgresql-socket~: Sometimes we need to hack!
+
+Whiles most of the interaction with the PostgreSQL server is automated and
+buried there are times when we want to interact with the socket outside of our driver.
+
+So once we've [[#postgresqlConnect][~-connect!~]]ed we can see the socket.
+
+#+begin_src scheme :noweb-ref postgresql-socket
 (def postgresql-socket thread-specific)
+#+end_src
 
-#;(defrules DEBUG ()
-  ((_ what arg ...)
-   (begin
-     (display what)
-     (begin (write arg) (display " ")) ...
-     (newline))))
 
-(defrules DEBUG ()
-  ((_ what arg ...)
-   (void)))
+** ~postgresql-connect!~: The startup
+:PROPERTIES:
+:CUSTOM_ID: postgresqlConnect
+:END:
 
-(def (postgresql-prepare-statement! conn name sql)
-  (with-driver conn driver
-    (!!postgresql.prepare driver name sql)))
+Connecting to the server and then spawning and returning the driver thread.
 
-(def (postgresql-close-statement! conn name)
-  (alet (driver (get-driver conn))
-    (!!postgresql.close driver name)))
-
-(def (postgresql-exec! conn name bind)
-  (with-driver conn driver
-    (!!postgresql.exec driver name bind)))
-
-(def (postgresql-query! conn name bind)
-  (with-driver conn driver
-    (!!postgresql.query driver name bind)))
-
-(def (postgresql-simple-query! conn str)
-  (with-driver conn driver
-    (!!postgresql.simple-query driver str)))
-
-(def (postgresql-continue! conn token)
-  (if (!token? token)
-    (with-driver conn driver
-      (!!postgresql.continue driver token))
-    (error "Bad argument; illegal query token" token)))
-
-(def (postgresql-reset! conn token)
-  (if (!token? token)
-    (alet (driver (get-driver conn))
-      (!!postgresql.reset driver token))
-    (error "Bad argument; illegal query token" token)))
-
-(def (postgresql-close! conn)
-  (alet (driver (get-driver conn))
-    (!!postgresql.shutdown driver)))
-
-;;; driver implementation
+#+begin_src scheme :noweb-ref postgresql-connect!
 (def (postgresql-connect! host port user passwd db)
   (def sock
     (open-tcp-client [server-address: host port-number: port]))
@@ -226,7 +589,32 @@
    (catch (e)
      (close-port sock)
      (raise e))))
+#+end_src
 
+
+** ~postgresql-driver~: The thread that drives our interaction
+
+There's a thread that talks to the server.
+
+*** Continue
+:PROPERTIES:
+:CUSTOM_ID: postgresqlDriverContinue
+:END:
+
+We may need to continue with one of our pumps.
+
+#+begin_src scheme :noweb-ref continue
+(def (continue token)
+  (when (eq? token query-token)
+    (if simple-query
+      (simple-query-pump)
+      (query-pump))))
+#+end_src
+
+
+*** /Proc/ ~postgresql-driver~
+
+#+begin_src scheme :noweb-ref postgresql-driver :noweb yes
 (def (postgresql-driver sock)
   (def query-limit 1000)
   (def query-output #f)
@@ -388,50 +776,11 @@
       (set! query-token #f)
       (resync!)))
 
-  (def (simple-query-start str)
-      (send! ['Query str])
-      (let ((ch (make-channel query-limit))
-               (token (make-!token)))
-           (set! query-output ch)
-           (set! query-token token)
-           (set! simple-query #t)
-           (values ch token)))
+  <<simple-query-start>>
 
-  (def (simple-query-pump)
-    (let/cc break
-      (let lp ()
-        (let ((r (recv!)))
-          (match r
-            (['RowDescription . fields]
-             (channel-sync query-output (postgresql-RowDescription fields))
-             (lp))
-            (['CommandComplete tag]
-             (channel-sync query-output (postgresql-CommandComplete tag))
-             (lp))
-            (['DataRow . cols]
-             (cond                                            ;
-              ((channel-try-put query-output cols)            ;
-               (lp))                                          ;
-              (else                                           ;
-               (channel-sync query-output cols query-token)   ;
-               (break))))
-            (['ReadyForQuery _]
-             (channel-sync query-output (eof-object)))  ;
-            (['EmptyQueryResponse]
-             (lp))
-            (['ErrorResponse msg . irritants]
-             (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!))
-             (lp)))))
-      (channel-close query-output)
-      (set! query-output #f)
-      (set! query-token #f)
-      (set! simple-query #f)))
+  <<simple-query-pump>>
 
-  (def (continue token)
-    (when (eq? token query-token)
-      (if simple-query
-        (simple-query-pump)
-        (query-pump))))
+  <<continue>>
   
   (def (close name)
     ;; Close (name) -> CloseComplete | ErrorResponse
@@ -498,8 +847,126 @@
       (channel-sync query-output (make-sql-error "connection error" [] 'postgresql-driver))
       (channel-close query-output))
     (close-port sock))))
+#+end_src
+** Messages
 
-;;; Protocol I/O
+*** Message Data Types
+
+ - Intn(i) :: An n-bit integer in network byte order (most significant byte
+   first). If i is specified it is the exact value that will appear, otherwise
+   the value is variable. Eg. Int16, Int32(42).
+
+ - Intn[k] :: An array of k n-bit integers, each in network byte order. The
+   array length k is always determined by an earlier field in the message. Eg.
+   Int16[M].
+
+ - String(s) :: A null-terminated string (C-style string). There is no specific
+   length limitation on strings. If s is specified it is the exact value that
+   will appear, otherwise the value is variable. Eg. String, String("user").
+
+       *Note* There is no predefined limit on the length of a string that can be
+   returned by the backend. Good coding strategy for a frontend is to use an
+   expandable buffer so that anything that fits in memory can be accepted. If
+   that's not feasible, read the full string and discard trailing characters
+   that don't fit into your fixed-size buffer.
+
+ - Byten(c) :: Exactly n bytes. If the field width n is not a constant, it is
+   always determinable from an earlier field in the message. If c is specified
+   it is the exact value. Eg. Byte2, Byte1('\n').
+
+*** Front End Messages
+:PROPERTIES:
+:CUSTOM_ID: frontEndMessages
+:END:
+
+#+begin_src scheme :noweb-ref "def front end messages"
+(defmessage-frontend
+  (Bind                     #\B  marshal-bind)
+  (Close                    #\C  marshal-close)
+  (CopyData                 #\d (marshal-fail 'CopyData))
+  (CopyDone                 #\c (marshal-fail 'CopyDone))
+  (CopyFail                 #\f (marshal-fail 'CopyFail))
+  (Describe                 #\D  marshal-describe)
+  (Execute                  #\E  marshal-exec)
+  (Flush                    #\H  marshal-empty)
+  (FunctionCall             #\F (marshal-fail 'FunctionCall))
+  (GSSResponse              #\p (marshal-fail 'GSSResponse))
+  (Parse                    #\P  marshal-parse)
+  (PasswordMessage          #\p  marshal-passwd)
+  (Query                    #\Q  marshal-query)
+  (SASLInitialResponse      #\p  marshal-sasl-initial-reponse)
+  (SASLResponse             #\p  marshal-sasl-response)
+  (Sync                     #\S  marshal-empty)
+  (Terminate                #\X  marshal-empty))
+#+end_src
+
+** The Protocol
+
+*** Protocols
+     :PROPERTIES:
+     :CUSTOM_ID: protocols
+     :END:
+
+Beyond structured messages, Gerbil provides protocols for structured
+interaction. Protocol messages can be one way messages (instances of
+=!event=), a remote call (instances of =!call=) or a value for a
+previous call (=!value= or =!error=).
+
+Protocols are defined with =defproto=, which defines structures and
+macros for using the protocol interfaces, together with marshalling
+support.
+
+#+BEGIN_SRC scheme
+(defproto postgresql
+  (prepare name sql)
+  (exec name params)
+  (query name params)
+  (simple-query str)
+  event:
+  (continue token)
+  (reset token)
+  (close name)
+  (shutdown))
+#+END_SRC
+
+In the example, we define a protocol =postgresql= with many calls. For ~exec~,
+for example, The macro defines the structures and macros for using the
+interface:
+
+#+BEGIN_SRC scheme
+  (defstruct postgresql.exec (name params))
+  (defsyntax-for-match !postgresql.exec ...)
+  (defrules !!postgresql.exec ...
+#+END_SRC
+
+The invocation =(!!postgresql.exec postgresql name params)= constructs a =!call=
+protocol message with an instance of =postgresql.exec= and a gensymed
+continuation id. It then sends the message to the =postgresql= actor and waits
+for a =!value= or =!error= message matching the continuation. If it receives a
+=!value= it returns it, and if it receives an =!error= it signals an error.
+
+In the actor, the =(!postgresql.exec what p k)= matches a =!call= with the value
+matching =(postgresql.exec what p)= and the continuation token bound to =k=. The
+actor displays its message, and then responds by sending a value with the
+=!!value= macro. An error could be signalled with the =!!error= macro.
+
+The syntax for =!!value= and =!!error= is similar: the take an optional
+destination (which defaults to =@source=), a value or error message and
+the continuation token:
+
+#+BEGIN_SRC scheme
+  (!!value [@source] val token)
+  (!!error [@source] msg token)
+#+END_SRC
+
+*** Protocol I/O
+
+**** ~postgresql-send!~
+:PROPERTIES:
+:CUSTOM_ID: postgresqlSend
+:END:
+
+#+begin_src scheme :noweb-ref postgresql-send!
 (def (postgresql-send! sock msg)
   (def (marshal-and-write tid body marshal)
     (let* ((payload (marshal body))
@@ -541,6 +1008,152 @@
       (marshal-and-write #f body marshal-startup))
      (else
       (raise-io-error 'postgresql-send! "cannot marshal; unknown message tag" msg)))))
+#+end_src
+* /File/ ~postgresql.ss~
+
+#+begin_src scheme
+;;; -*- Gerbil -*-
+;;; (C) drewc, vyzo
+;;; PostgreSQL dbi interface
+
+(import :drewc/db/dbi
+        :drewc/db/postgresql-driver
+        :std/iter
+        :std/misc/channel
+        :std/srfi/19)
+(export postgresql-connect
+        defcatalog
+        defcatalog-default
+        default-catalog
+        current-catalog)
+
+<<postgresql-connection>>
+#+end_src
+
+* /File/ ~postgresql-driver.ss~
+
+#+begin_src scheme :tangle postgresql-driver.ss :noweb yes
+;;; -*- Gerbil -*-
+;;; (C) vyzo
+;;; PostgreSQL driver
+
+(import :gerbil/gambit/threads
+        :gerbil/gambit/ports
+        :gerbil/gambit/bits
+        :std/actor/proto
+        :std/actor/message
+        :std/misc/channel
+        :std/misc/list
+        :std/net/bio
+        :std/net/sasl
+        :std/text/utf8
+        :std/text/hex
+        :std/crypto
+        :std/logger
+        :std/sugar
+        :std/error
+        :drewc/db/dbi)
+(export postgresql-connect!
+        postgresql-prepare-statement!
+        postgresql-close-statement!
+        postgresql-exec!
+        postgresql-query!
+        postgresql-simple-query!
+        postgresql-continue!
+        postgresql-reset!
+        postgresql-close!
+        postgresql-socket
+        postgresql-message
+        postgresql-message-name
+        postgresql-message-args
+        postgresql-RowDescription?
+        (rename: !token? query-token?))
+
+(deflogger postgres)
+
+;;; driver interface
+(defproto postgresql
+  (prepare name sql)
+  (exec name params)
+  (query name params)
+  (simple-query str)
+  event:
+  (continue token)
+  (reset token)
+  (close name)
+  (shutdown))
+
+<<postgresql-message>>
+
+(defrules with-driver ()
+  ((_ conn driver body ...)
+   (cond
+    ((thread? conn)
+     (let (driver conn)
+       body ...))
+    ((connection-e conn)
+     => (lambda (driver) body ...))
+    (else
+     (error "connection has been closed" conn)))))
+
+(defrules get-driver ()
+  ((_ conn)
+   (if (thread? conn) conn (connection-e conn))))
+
+<<postgresql-socket>>
+
+#;(defrules DEBUG ()
+  ((_ what arg ...)
+   (begin
+     (display what)
+     (begin (write arg) (display " ")) ...
+     (newline))))
+
+(defrules DEBUG ()
+  ((_ what arg ...)
+   (void)))
+
+(def (postgresql-prepare-statement! conn name sql)
+  (with-driver conn driver
+    (!!postgresql.prepare driver name sql)))
+
+(def (postgresql-close-statement! conn name)
+  (alet (driver (get-driver conn))
+    (!!postgresql.close driver name)))
+
+(def (postgresql-exec! conn name bind)
+  (with-driver conn driver
+    (!!postgresql.exec driver name bind)))
+
+(def (postgresql-query! conn name bind)
+  (with-driver conn driver
+    (!!postgresql.query driver name bind)))
+
+<<postgresql-simple-query>>
+
+(def (postgresql-continue! conn token)
+  (if (!token? token)
+    (with-driver conn driver
+      (!!postgresql.continue driver token))
+    (error "Bad argument; illegal query token" token)))
+
+(def (postgresql-reset! conn token)
+  (if (!token? token)
+    (alet (driver (get-driver conn))
+      (!!postgresql.reset driver token))
+    (error "Bad argument; illegal query token" token)))
+
+(def (postgresql-close! conn)
+  (alet (driver (get-driver conn))
+    (!!postgresql.shutdown driver)))
+
+;;; driver implementation
+<<postgresql-connect!>>
+
+<<postgresql-driver>>
+
+;;; Protocol I/O
+<<postgresql-send!>>
 
 (def (postgresql-recv! sock buf)
   (def (read-u32 sock u8v)
@@ -869,3 +1482,5 @@
   (SASLResponse             #\p  marshal-sasl-response)
   (Sync                     #\S  marshal-empty)
   (Terminate                #\X  marshal-empty))
+
+#+end_src
