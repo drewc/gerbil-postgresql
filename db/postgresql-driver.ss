@@ -32,6 +32,7 @@
         postgresql-message-name
         postgresql-message-args
         postgresql-RowDescription?
+        postgresql-CommandComplete?
         (rename: !token? query-token?))
 
 (deflogger postgres)
@@ -389,6 +390,7 @@
       (resync!)))
 
   (def (simple-query-start str)
+      (maybe-sync!)
       (send! ['Query str])
       (let ((ch (make-channel query-limit))
                (token (make-!token)))
@@ -397,35 +399,41 @@
            (set! simple-query #t)
            (values ch token)))
 
+  (def inside-rows #f)
   (def (simple-query-pump)
     (let/cc break
-      (let lp ()
-        (let ((r (recv!)))
-          (match r
-            (['RowDescription . fields]
-             (channel-sync query-output (postgresql-RowDescription fields))
-             (lp))
-            (['CommandComplete tag]
-             (channel-sync query-output (postgresql-CommandComplete tag))
-             (lp))
-            (['DataRow . cols]
-             (cond                                            ;
-              ((channel-try-put query-output cols)            ;
-               (lp))                                          ;
-              (else                                           ;
-               (channel-sync query-output cols query-token)   ;
-               (break))))
-            (['ReadyForQuery _]
-             (channel-sync query-output (eof-object)))  ;
-            (['EmptyQueryResponse]
-             (lp))
-            (['ErrorResponse msg . irritants]
-             (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!))
-             (lp)))))
+        (let lp ()
+          (let ((r (recv!)))
+            (match r
+              (['RowDescription . fields]
+               (channel-sync query-output (postgresql-RowDescription fields))
+               (set! inside-rows query-token)
+               (lp))
+              (['CommandComplete tag]
+               (when (eq? inside-rows query-token)
+                 (channel-sync query-output (void))
+                 (set! inside-rows #f))
+               (channel-sync query-output (postgresql-CommandComplete tag))
+               (lp))
+              (['DataRow . cols]
+               (cond                                        ;
+                ((channel-try-put query-output cols)        ;
+                 (lp))                                      ;
+                (else                                       ;
+                 (channel-sync query-output cols query-token) ;
+                 (break))))
+              (['ReadyForQuery _]
+               (channel-sync query-output (eof-object)))
+              (['EmptyQueryResponse]
+               (lp))
+              (['ErrorResponse msg . irritants]
+               (channel-sync query-output (make-sql-error msg irritants 'postgresql-simple-query!))
+               (lp))))))
       (channel-close query-output)
       (set! query-output #f)
       (set! query-token #f)
-      (set! simple-query #f)))
+      (set! simple-query #f)
+      (set! inside-rows #f))
 
   (def (continue token)
     (when (eq? token query-token)

@@ -18,40 +18,6 @@ We need to connect to a database. This is the superstruct, which is exported.
 (defmethod {:init! connection}
   (lambda (self e)
     (struct-instance-init! self e)))
-#+end_src
-
-
-
-#+begin_src scheme :tangle dbi.ss :noweb yes
-;;; -*- Gerbil -*-
-;;; (C) vyzo
-;;; Generic SQL database interface
-
-(import (only-in :gerbil/gambit/misc make-will)
-        :std/sugar
-        :std/iter
-        :std/generic
-        :std/error)
-(export
-  (struct-out connection statement sql-error)
-  connection:::init!
-  raise-sql-error
-  sql-connect sql-close sql-prepare
-  sql-bind sql-clear sql-reset sql-reset/clear sql-finalize
-  sql-eval sql-eval-query
-  sql-exec sql-query in-sql-query sql-columns
-  sql-txn-begin sql-txn-commit sql-txn-abort)
-
-<<defstruct connection>>
-
-(defstruct statement (e))
-
-
-
-(defstruct (sql-error <error>) ())
-
-(def (raise-sql-error where what . irritants)
-  (raise (make-sql-error what irritants where)))
 
 (def (sql-connect connect . args)
   (let (conn (apply connect args))
@@ -77,6 +43,63 @@ We need to connect to a database. This is the superstruct, which is exported.
 
 (defmethod {destroy connection}
   sql-close)
+#+end_src
+
+
+* Statements
+:PROPERTIES:
+:CUSTOM_ID: statementStruct
+:END:
+
+It's wonderfully simple. Every interaction ends up as a statement. That keeps things very clean.
+
+#+begin_src scheme :noweb-ref define statement
+(defstruct statement (e))
+#+end_src
+
+
+* Iteration
+:PROPERTIES:
+:CUSTOM_ID: statementIter
+:END:
+
+Because everything is a statement we just need a way to iterate over the
+results. How/where they come to us is a mystery that simplicity solves.
+
+#+begin_src scheme :noweb-ref iter sql statement
+#+end_src
+
+
+#+begin_src scheme :tangle dbi.ss :noweb yes
+;;; -*- Gerbil -*-
+;;; (C) vyzo
+;;; Generic SQL database interface
+
+(import (only-in :gerbil/gambit/misc make-will)
+        :std/sugar
+        :std/iter
+        :std/generic
+        :std/error)
+(export
+  (struct-out connection statement sql-error)
+  connection:::init!
+  raise-sql-error
+  sql-connect sql-close sql-prepare
+  sql-bind sql-clear sql-reset sql-reset/clear sql-finalize
+  sql-eval sql-eval-query
+  sql-exec sql-query in-sql-query sql-columns
+  sql-txn-begin sql-txn-commit sql-txn-abort)
+
+<<defstruct connection>>
+
+<<define statement>>
+
+(defstruct (sql-error <error>) ())
+
+(def (raise-sql-error where what . irritants)
+  (raise (make-sql-error what irritants where)))
+
+
 
 (def (sql-txn-do conn sql getf setf)
   (with ((connection e) conn)

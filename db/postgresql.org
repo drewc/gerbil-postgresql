@@ -1,10 +1,10 @@
-#+TITLE: Postgresql
+#+TITLE: PostgreSQL
 
 https://www.postgresql.org/docs/13/protocol-message-formats.html
 
 * Add "simple query"
 
-Here's the thing. Postgresql can take a string that has mulitple statements as a
+Here's the thing. Postgresql can take a string that has multiple statements as a
 single query.
 
 #+begin_quote
@@ -62,7 +62,7 @@ https://www.postgresql.org/docs/13/protocol-flow.html#id-1.10.5.7.4
 
 The ~postgresql-send!~ procedure takes care of the byte and length for us.
 
-The *Front End Message* takes care of the marshalling.
+The *Front End Message* takes care of the marshaling.
 
 #+begin_src scheme
   (Query                    #\Q  marshal-query)
@@ -75,7 +75,7 @@ So that means that all we need is to send the query.
                 ' to life, the universe, ' \"and everything\""])
 #+end_src
 
-**** ~marshall-query~
+**** ~marshal-query~
 
 #+begin_src scheme
 (def (marshal-query body)
@@ -85,7 +85,7 @@ So that means that all we need is to send the query.
       bio)))
 #+end_src
 
-*** Receive the Reponse
+*** Receive the Response
 
 According to the docs a select will first return a ~RowDescription~.
 
@@ -177,6 +177,7 @@ To start with with ~send!~ the query, make a unique token, and mention this is a
 
 #+begin_src scheme :noweb-ref simple-query-start
 (def (simple-query-start str)
+    (maybe-sync!)
     (send! ['Query str])
     (let ((ch (make-channel query-limit))
              (token (make-!token)))
@@ -225,7 +226,7 @@ A warning message has been issued in relation to the query. Notices are in addit
 
 #+end_quote
 
-Ok! So a query and then the result is returned until ~ReadyForQuery~.
+OK! So a query and then the result is returned until ~ReadyForQuery~.
 
 We do not really care about the results beyond passing them up to those that do.
 
@@ -248,39 +249,53 @@ We do not really care about the results beyond passing them up to those that do.
 
 *** ~simple-query-pump~
 The only thing that makes this "special" is the ~query-limit~. When we reach the
-limit the pump stops running until signalled to run again. This is essentially
-so we can iteratate over a tonne a rows without needing them all in memory.
+limit the pump stops running until signaled to run again.
+
+This is essentially so we can iterate over a tonne a rows without needing them
+all in memory.
+
+Because ~#!eof~ is a value that maybe abused somewhat, the end of a statement that outputs rows is marked by ~#!void~.
+
+We do this by setting "inside rows" to the token when a RowDescription comes.
+
+If the inside-rows is also the query-token we are currently inside a "statement".
 
 #+begin_src scheme :noweb-ref simple-query-pump
+(def inside-rows #f)
 (def (simple-query-pump)
   (let/cc break
-    (let lp ()
-      (let ((r (recv!)))
-        (match r
-          (['RowDescription . fields]
-           (channel-sync query-output (postgresql-RowDescription fields))
-           (lp))
-          (['CommandComplete tag]
-           (channel-sync query-output (postgresql-CommandComplete tag))
-           (lp))
-          (['DataRow . cols]
-           (cond                                            ;
-            ((channel-try-put query-output cols)            ;
-             (lp))                                          ;
-            (else                                           ;
-             (channel-sync query-output cols query-token)   ;
-             (break))))
-          (['ReadyForQuery _]
-           (channel-sync query-output (eof-object)))  ;
-          (['EmptyQueryResponse]
-           (lp))
-          (['ErrorResponse msg . irritants]
-           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!))
-           (lp)))))
+      (let lp ()
+        (let ((r (recv!)))
+          (match r
+            (['RowDescription . fields]
+             (channel-sync query-output (postgresql-RowDescription fields))
+             (set! inside-rows query-token)
+             (lp))
+            (['CommandComplete tag]
+             (when (eq? inside-rows query-token)
+               (channel-sync query-output (void))
+               (set! inside-rows #f))
+             (channel-sync query-output (postgresql-CommandComplete tag))
+             (lp))
+            (['DataRow . cols]
+             (cond                                        ;
+              ((channel-try-put query-output cols)        ;
+               (lp))                                      ;
+              (else                                       ;
+               (channel-sync query-output cols query-token) ;
+               (break))))
+            (['ReadyForQuery _]
+             (channel-sync query-output (eof-object)))
+            (['EmptyQueryResponse]
+             (lp))
+            (['ErrorResponse msg . irritants]
+             (channel-sync query-output (make-sql-error msg irritants 'postgresql-simple-query!))
+             (lp))))))
     (channel-close query-output)
     (set! query-output #f)
     (set! query-token #f)
-    (set! simple-query #f)))
+    (set! simple-query #f)
+    (set! inside-rows #f))
 #+end_src
 
 *** Test out the pump
@@ -406,30 +421,62 @@ We need a connection to our db.
 
 Now just like the backend we get some input that needs processing.
 
-* ~postgresql-query~ struct
-
-To make it simple we can sub the statement.
-
 #+begin_src scheme
-(defstruct (postgresql-query postgresql-statement) ()
-  constructor: :init!
-  final: #t)
-
-(defmethod {:init! postgresql-query}
-  (lambda (self conn str)
-    (struct-instance-init! self #f conn str)))
-
-(defalias postgresql-query-str postgresql-statement-params)
-
-(defmethod {query-start postgresql-query}
-  (lambda (self)
-    (with ((postgresql-query name conn str) self)
-      (let ((values inp token) (postgresql-simple-query! conn str))
-        (set! (postgresql-statement-token self) token)
-        (set! (postgresql-statement-inp self) inp)
-        (set! (postgresql-statement-row self) #f)))))
+(defvalues (inp token)
+        (postgresql-simple-query! conn "BEGIN;
+  CREATE TEMP TABLE foo (bar int);
+  INSERT INTO foo VALUES (42) RETURNING 'the answer:', bar;
+  ROLLBACK;"))
 #+end_src
 
+That gives us a little of what we need. I
+
+#+begin_src scheme
+(user)> (pretty-print (for/collect (msg (:iter inp)) msg))
+(#<postgresql-CommandComplete #43 args: "BEGIN">
+ #<postgresql-CommandComplete #44 args: "CREATE TABLE">
+ #<postgresql-RowDescription #45
+    args: (("?column?" 0 0 25 -1 -1 0) ("bar" 58527 1 23 4 -1 0))>
+ ("the answer:" "42")
+ #<postgresql-CommandComplete #46 args: "INSERT 0 1">
+ #<postgresql-CommandComplete #47 args: "ROLLBACK">)
+#!void
+#+end_src
+
+That tells me that "Commands" are the classification I was looking for.
+
+So everything is a [[#frontEndCommand][Command]], with a query command containing and returning other commands.
+
+** Query command -> commands
+
+We'll try a query with 4 commands.
+
+#+begin_src scheme
+(begin
+  (import :drewc/db/postgresql :drewc/db/dbi :std/iter)
+  (extern pretty-print)
+
+
+  (def conn (postgresql-connect host:  "localhost" port: 5432 user: "maxclaims" passwd: "y3am2e!!"))
+
+  (def q (postgresql-query conn "BEGIN;
+  CREATE TEMP TABLE foo (bar int);
+  INSERT INTO foo VALUES (42), (420) RETURNING 'the answer to' \"what is\", bar ltuae ;
+  ROLLBACK;"))
+
+  (pretty-print (for/collect (cmd (:iter q)) (pretty-print cmd)
+    (let (o (sql-query cmd))
+      (cons (postgresql-command-complete cmd)
+            (map (cut map cons {columns cmd} <>) (map vector->list o)))))))
+#+end_src
+
+* Prepared Statements
+
+Statements can be prepared ahead of time.
+
+#+begin_src scheme
+
+#+end_src
 
 * Front End
 
@@ -456,8 +503,444 @@ We need to connect to a server. Time to sub [[file:dbi.org::#connectionStruct][C
     (postgresql-close! self)))
 #+end_src
 
+*** Prepare a Statement
+:PROPERTIES:
+:CUSTOM_ID: frontEndConnectionPrepare
+:END:
+
+We use a connection to make and create a [[#frontEndStatements][Statement]].
+
+The driver takes care of what we need so in reality all we do is provide a name and the sql.
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {prepare postgresql-connection}
+  (lambda (self sql)
+    (let* ((name (symbol->string (gensym 'stmt)))
+           ((values params cols)
+            (postgresql-prepare-statement! self name sql)))
+      (make-postgresql-statement self name: name cols params: params))))
+#+end_src
+** Command
+:PROPERTIES:
+:CUSTOM_ID: frontEndCommand
+:END:
+
+A command is the encapsulation of the front end's interaction with the server.
+
+All commands are DBI [[file:dbi.org::#statementStruct][Statements]]. For the most part they are unnamed. But they do need a name of somesort to say they are running.
+
+#+begin_src scheme :noweb-ref command struct
+(defstruct (postgresql-command statement) (conn complete input token)
+  constructor: :init!
+  print: (complete))
+
+(defstruct !unnamed () final: t)
+(def unnamed-command (make-!unnamed))
+
+(defmethod {:init! postgresql-command}
+  (lambda (self conn name: (name unnamed-command) complete: (complete #f))
+    (struct-instance-init! self name conn complete)))
 
 
+(defmethod {query-start postgresql-command} void)
+(defmethod {query-fini postgresql-command} postgresql-command::reset)
+(defmethod {query-fetch postgresql-command} (lambda _ iter-end))
+(defmethod {query-row postgresql-command} postgresql-command-complete)
+(defmethod {columns postgresql-command} (lambda _ '()))
+#+end_src
+
+*** Reset
+
+For some commands the db and driver are returning things even though we are done with them. Even if they are not, we want to be done with it.
+
+The driver knows if we are still in this command, so we just say to reset it.
+
+#+begin_src scheme :noweb-ref command reset
+(defmethod {reset postgresql-command}
+  (lambda (self)
+    (alet (token (postgresql-command-token self))
+      (postgresql-reset! (postgresql-command-conn self) token)
+      (set! (postgresql-command-token self) #f)
+      (set! (postgresql-command-input self) #f))))
+#+end_src
+** Statement
+:PROPERTIES:
+:CUSTOM_ID: frontEndStatements
+:END:
+
+#+begin_src scheme :noweb-ref statement struct
+(defstruct (postgresql-statement postgresql-command) (cols params bind row)
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! postgresql-statement}
+  (lambda (self conn name: (name unnamed-command)
+                cols params: (params []))
+    (struct-instance-init! self name conn #f #f #f cols params)))
+#+end_src
+
+
+A row is easy.
+
+#+begin_src scheme :noweb-ref statement query
+(defmethod {query-row postgresql-statement}
+  (lambda (self)
+    (postgresql-statement-row self)))
+#+end_src
+
+As are columns.
+
+#+begin_src scheme :noweb-ref statement query
+(defmethod {columns postgresql-statement}
+   (lambda (self)
+     (map car (postgresql-statement-cols self))))
+
+
+#+end_src
+
+And to ~-fini~'sh it up we just reset it
+
+#+begin_src scheme :noweb-ref statement query
+
+(defmethod {query-fini postgresql-statement}
+   postgresql-statement::reset)
+#+end_src
+
+** Prepared statements
+
+Some statements are prepared and can be used as individual procedures.
+
+They are prepared via a [[#frontEndConnectionPrepare][Connection]].
+
+*** Binding
+
+For binding a statement we simply serialize the args of the statement. That way we have something to call the prepared statement with.
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {bind postgresql-statement}
+  (lambda (self . args)
+    (def (value->binding type-oid arg)
+      (cond
+       ((not arg)
+        ;; #f is NULL normally ... unless it's a BOOL
+        (if (fx= type-oid 16)
+          (serialize-boolean arg)
+          #f))
+       ((string? arg) arg)
+       ((catalog-serializer (current-catalog) type-oid)
+        => (cut <> arg))
+       (else
+        (error "Cannot bind; Parameter type oid not in (current-catalog)" type-oid arg))))
+    (let* ((params (postgresql-statement-params self))
+           (bind (map value->binding params args)))
+      (set! (postgresql-statement-bind self) bind)
+      (void))))
+#+end_src
+
+**** Clear binding
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {clear postgresql-statement}
+  (lambda (self)
+    (set! (postgresql-statement-bind self) #f)))
+#+end_src
+
+*** Exec
+
+There are some times when we just want to execute a statement and do not care about rows.
+
+The driver returns the value of CommandComplete, so all we really need to do is
+set that and return it.
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {exec postgresql-statement}
+  (lambda (self)
+    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
+      (let (comp (postgresql-exec! conn name (or bind [])))
+        (begin0 comp
+          (set! (postgresql-command-complete self) comp))))))
+#+end_src
+
+*** Finalize: Close the prepared statement and reset
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {finalize postgresql-statement}
+  (lambda (self)
+    (with ((postgresql-statement name conn) self)
+      (postgresql-statement::reset self)
+      (postgresql-close-statement! conn name))))
+#+end_src
+
+** Reset statement
+
+#+begin_src scheme :noweb-ref Prepared Statement Methods
+(defmethod {reset postgresql-statement}
+  (lambda (self)
+    (postgresql-command::reset self)
+    (set! (postgresql-statement-row self) #f)))
+#+end_src
+
+** Statement Query
+
+There are a few different types of statements. When one is fetched from a [[#frontEndQuery][Query]] it has already been started and is ~!unnamed?~.
+
+#+begin_src scheme :noweb-ref statement query
+(def (postgresql-statement-in-query? stmt)
+  (!unnamed? (statement-e stmt)))
+
+(defmethod {query-start postgresql-statement}
+  (lambda (self)
+    (unless (postgresql-statement-in-query? self)
+    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
+      (let ((values inp token) (postgresql-query! conn name (or bind [])))
+        (set! (postgresql-command-token self) token)
+        (set! (postgresql-command-input self) inp)
+        (set! (postgresql-statement-row self) #f))))))
+
+#+end_src
+
+
+#+begin_src scheme :noweb-ref statement query
+(defmethod {query-fetch postgresql-statement}
+  (lambda (self)
+    (def (result->row cols)
+      (let (res (map result->value cols (postgresql-statement-cols self)))
+        (cond
+         ((null? res) #f)
+         ((null? (cdr res))
+          (car res))
+         (else
+          (list->vector res)))))
+
+    (def (result->value res col)
+      (and res ; NULL is #f
+           (let (type-oid (list-ref col 3))
+             (value-e res type-oid))))
+
+    (def (value-e res type-oid)
+      (cond
+       ((catalog-deserializer (current-catalog) type-oid)
+        => (cut <> res))
+       (else res)))
+
+    (cond
+     ((postgresql-command-input self)
+      => (lambda (inp)
+           (let again ()
+             (let (next (channel-get inp))
+               (cond
+                ((or (eof-object? next) (void? next))
+                 (when (void? next)
+                   (let ((next (channel-get inp)))
+                     (set! (postgresql-command-complete self)
+                       (postgresql-message-args next))))
+                 (set! (postgresql-command-token self) #f)
+                 (set! (postgresql-command-input self) #f)
+                 (set! (postgresql-statement-row self) #f)
+                 iter-end)
+                ((exception? next)
+                 (raise next))
+                ((query-token? next)
+                 (postgresql-continue! (postgresql-command-conn self) next)
+                 (again))
+                (else
+                 (let (row (result->row next))
+                   (set! (postgresql-statement-row self) row)
+                   (void))))))))
+     (else iter-end))))
+#+end_src
+
+
+** Query
+:PROPERTIES:
+:CUSTOM_ID: frontEndQuery
+:END:
+
+#+begin_src scheme :noweb-ref query struct
+(defstruct (postgresql-query postgresql-command) (str cmd)
+  constructor: :init!
+  print: (str)
+  final: #t)
+
+(defmethod {:init! postgresql-query}
+  (lambda (self conn str)
+    (struct-instance-init! self unnamed-command conn #f #f #f str)))
+#+end_src
+
+The [[file:dbi.org::#statementIter][Iterate]] procedure needs 4 methods.
+
+  - query-start
+  - query-fetch
+  - query-row
+  - query-fini
+
+A row is just the last command fetched.
+
+#+begin_src scheme :noweb-ref query query
+(defmethod {query-row postgresql-query} postgresql-query-cmd)
+#+end_src
+
+To start is very simple.
+
+#+begin_src scheme :noweb-ref query query
+(defmethod {query-start postgresql-query}
+  (lambda (self)
+    (with ((postgresql-query _ conn _ _ _ str) self)
+      (let ((values inp token) (postgresql-simple-query! conn str))
+        (set! (postgresql-command-token self) token)
+        (set! (postgresql-command-input self) inp)))))
+#+end_src
+
+Fetching is slightly more complex. There are, ideally, only two objects that are looked at to return a single command from each fetch.
+
+  - CommandComplete :: When there are no rows left or no rows at all this is
+    what is given to us.
+  - RowDescription :: When there are rows we get this.
+
+
+
+#+begin_src scheme :noweb-ref query query
+(defmethod {query-fetch postgresql-query}
+  (lambda (self)
+    (with ((postgresql-query _ conn _ inp token _ cmd) self)
+      (if (not inp) iter-end
+          (let again ()
+             (let (next (channel-get inp))
+               (cond
+                ((eof-object? next)
+                 (set! (postgresql-command-token self) #f)
+                 (set! (postgresql-command-input self) #f)
+                 iter-end)
+                ((exception? next)
+                 (raise next))
+                ((query-token? next)
+                 (postgresql-continue! (postgresql-command-conn self) next)
+                 (again))
+                ((postgresql-CommandComplete? next)
+                 (let ((comp (postgresql-message-args next)))
+                   (when cmd (set! (postgresql-command-input cmd) #f))
+                   (cond ((or (not cmd) (postgresql-command-complete cmd))
+                          (set! (postgresql-query-cmd self)
+                            (make-postgresql-command conn complete: comp)))
+                         (else
+                          (set! (postgresql-command-complete cmd) comp)
+                          (again))))
+                 (void))
+                ((postgresql-RowDescription? next)
+                 (let (stmt (make-postgresql-statement
+                             conn (postgresql-message-args next)))
+                   (set! (postgresql-command-input stmt) inp)
+                   ;; (set! (postgresql-command-token stmt) self)
+                   (set! (postgresql-query-cmd self) stmt))
+                 (void))
+                (else
+                 (again)))))))))
+#+end_src
+
+
+
+
+
+
+
+** Catalog
+
+#+begin_src scheme :noweb-ref catalog
+;;; catalog/pg_type.h
+(defstruct catalog (s d)
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! catalog}
+  (lambda (self . mixin)
+    (let ((s (make-hash-table-eq))
+          (d (make-hash-table-eq)))
+      (for-each
+        (lambda (mixin)
+          (hash-merge! s (catalog-s mixin))
+          (hash-merge! d (catalog-d mixin)))
+        mixin)
+      (struct-instance-init! self s d))))
+
+(def (catalog-serializer c oid)
+  (hash-get (catalog-s c) oid))
+
+(def (catalog-deserializer c oid)
+  (hash-get (catalog-d c) oid))
+
+(defrules defcatalog ()
+  ((_ (name mixin ...) (oids serialize deserialize) ...)
+   (begin
+     (def name (make-catalog mixin ...))
+     (defcatalog-type name oids serialize deserialize) ...))
+  ((recur name . body)
+   (identifier? #'name)
+   (recur (name) . body)))
+
+(defrules defcatalog-type ()
+  ((_ name (oid ...) serialize deserialize)
+   (begin
+     (hash-put! (catalog-s name) oid serialize) ...
+     (hash-put! (catalog-d name) oid deserialize) ...)))
+
+(defrules defcatalog-default ()
+  ((_ clause ...)
+   (begin
+     (defcatalog-type default-catalog . clause)
+     ...)))
+
+(def (serialize-boolean arg)
+  (if arg "t" "f"))
+
+(def (deserialize-boolean str)
+  (if (member str '("t" "true" "TRUE" "y" "yes" "on" "1")) #t #f))
+
+(def (serialize-date date)
+  (date->string date "~Y-~m-~d"))
+
+(def (deserialize-date str)
+  (string->date str "~Y-~m-~d"))
+
+(def (serialize-timestamp date)
+  (date->string date "~Y-~m-~d ~H:~M:~S"))
+
+(def (deserialize-timestamp str)
+  (string->date str "~Y-~m-~d ~H:~M:~S"))
+
+(def (serialize-timestamptz date)
+  (date->string date "~Y-~m-~d ~H:~M:~S~z"))
+
+(def (deserialize-timestamptz str)
+  (string->date str "~Y-~m-~d ~H:~M:~S~z"))
+
+(def (identity-string obj)
+  (if (string? obj) obj
+      (error "Bad argument; expected string" obj)))
+
+(defcatalog default-catalog
+  ;; BOOLOID
+  ((16) serialize-boolean deserialize-boolean)
+  ;; INT8OID INT2OID INT4OID FLOAT4OID FLOAT8OID NUMERICOID
+  ((20 21 23 700 701 1700) number->string string->number)
+  ;; CHAROID TEXTOID BPCHAROID VARCHAROID
+  ((18 25 1042 1043) identity-string identity)
+  ;; DATEOID
+  ((1082) serialize-date deserialize-date)
+  ;; TIMESTAMPOID
+  ((1114) serialize-timestamp deserialize-timestamp)
+  ;; TIMESTAMPTZOID
+  ((1184) serialize-timestamptz deserialize-timestamptz)
+
+  ;; Add more from the catalog here depending on actual needs...
+  ;; - automagic json serialization/deserialization?
+  ;;   add JSONOID with json-object->string string->json-object
+  ;; - automagic uuid conversion?
+  ;;   add UUIDOID with uuid->string string->uuid
+  )
+
+(def current-catalog
+  (make-parameter default-catalog))
+#+end_src
 * The Backend Driver
 
 #+begin_quote
@@ -1011,7 +1494,7 @@ the continuation token:
 #+end_src
 * /File/ ~postgresql.ss~
 
-#+begin_src scheme
+#+begin_src scheme :tangle postgresql.ss :noweb yes
 ;;; -*- Gerbil -*-
 ;;; (C) drewc, vyzo
 ;;; PostgreSQL dbi interface
@@ -1022,12 +1505,33 @@ the continuation token:
         :std/misc/channel
         :std/srfi/19)
 (export postgresql-connect
+        (struct-out postgresql-command
+                    postgresql-statement
+                    postgresql-query)
         defcatalog
         defcatalog-default
         default-catalog
         current-catalog)
 
 <<postgresql-connection>>
+
+<<command struct>>
+
+<<command reset>>
+
+<<statement struct>>
+
+<<statement query>>
+
+<<Prepared Statement Methods>>
+
+<<query struct>>
+
+<<query query>>
+
+<<catalog>>
+
+
 #+end_src
 
 * /File/ ~postgresql-driver.ss~
@@ -1067,6 +1571,7 @@ the continuation token:
         postgresql-message-name
         postgresql-message-args
         postgresql-RowDescription?
+        postgresql-CommandComplete?
         (rename: !token? query-token?))
 
 (deflogger postgres)

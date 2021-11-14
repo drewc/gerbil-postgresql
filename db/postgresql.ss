@@ -8,112 +8,15 @@
         :std/misc/channel
         :std/srfi/19)
 (export postgresql-connect
+        (struct-out postgresql-command
+                    postgresql-statement
+                    postgresql-query)
         defcatalog
         defcatalog-default
         default-catalog
         current-catalog)
 
-(defstruct (postgresql-connection connection) ()
-  final: #t)
-
-(defstruct (postgresql-query statement) (conn str stmts inp token)
-  constructor: :init!
-  final: #t)
-
-(defmethod {:init! postgresql-query}
-  (lambda (self conn str)
-    (struct-instance-init! self (eof-object) conn str)))
-
-(def (statements<-query query)
-  (def stmts [])
-  (def stmt-cols postgresql-message-args)
-  (with ((postgresql-query _ conn _ _ inp token) query)
-    (let next ()
-      (def tok (channel-get inp))
-      (def out (make-channel))
-      (unless (eof-object? tok)
-        (let ((stmt (make-postgresql-statement
-                     (eof-object) conn #f (stmt-cols tok))))
-         (set! (postgresql-statement-token stmt) token)
-         (set! (postgresql-statement-row stmt) #f)
-         (let lp ()
-           (def row (channel-get inp))
-           (cond
-            ((eof-object? row)
-             (set! (postgresql-statement-inp stmt) out)
-             (set! stmts [stmt stmts ...])
-             (next))
-            ((query-token? row)
-              (postgresql-continue! conn row)
-              (lp))
-            (else
-             (channel-put out row)
-                  (lp))))))
-      )
-    (reverse stmts)))
-
- (defmethod {query-start postgresql-query}
-  (lambda (self)
-    (def stmt-cols postgresql-message-args)
-    (with ((postgresql-query _ conn str) self)
-      (let ((values inp token) (postgresql-simple-query! conn str))
-        (set! (postgresql-query-token self) token)
-        (set! (postgresql-query-inp self) inp)
-        (set! (postgresql-query-stmts self) (statements<-query self))))))
-
-#;(defmethod {query-start postgresql-query}
-  (lambda (self)
-    (def stmt-cols RowDescription-fields)
-    (with ((postgresql-query _ conn str) self)
-      (let* (((values inp token) (postgresql-simple-query! conn str))
-             (stmt (make-postgresql-statement
-                    #f conn #f (stmt-cols (channel-get inp)))))
-        (set! (postgresql-statement-token stmt) token)
-        (set! (postgresql-query-token self) token)
-        (set! (postgresql-statement-inp stmt) inp)
-        (set! (postgresql-query-inp self) inp)
-        (set! (postgresql-statement-row stmt) #f)
-        (set! (postgresql-query-stmts self) [stmt])))))
-
-(defmethod {query-fetch postgresql-query}
-  (lambda (self)
-    (def stmt-cols postgresql-message-args)
-    (let* ((stmt (car (postgresql-query-stmts self)))
-           (inp (postgresql-statement-inp stmt))
-           (val {query-fetch stmt}))
-      (if (iter-end? val)
-        (let* ((rd? (channel-get inp)))
-          (if (eof-object? rd?) iter-end
-              (let* ((conn (postgresql-query-conn self))
-                     (token (postgresql-query-token self))
-                     (stmt (make-postgresql-statement
-                            #f conn #f (stmt-cols rd?))))
-                (set! (postgresql-statement-token stmt) token)
-                (set! (postgresql-statement-inp stmt) inp)
-                (set! (postgresql-statement-row stmt) #f)
-                (set! (postgresql-query-stmts self)
-                  [stmt (postgresql-query-stmts self) ...])
-                {query-fetch self})))
-        val))))
-
-(defmethod {query-row postgresql-query}
-  (lambda (self)
-    (postgresql-statement-row (car (postgresql-query-stmts self)))))
-
-
-(defmethod {columns postgresql-query}
-  (lambda (self)
-    (def stmt-cols postgresql-message-args)
-    (map car (postgresql-statement-cols (car (postgresql-query-stmts self))))))
-
-
-(defstruct (postgresql-statement statement) (conn params cols bind row inp token)
-  constructor: :init!
-  final: #t)
-
-(defmethod {:init! postgresql-statement}
-  (lambda (self name conn params cols)
-    (struct-instance-init! self name conn params cols)))
+(defstruct (postgresql-connection connection) () final: #t)
 
 (def (postgresql-connect host: (host "127.0.0.1")
                          port: (port 5432)
@@ -127,63 +30,62 @@
   (lambda (self)
     (postgresql-close! self)))
 
-(defmethod {prepare postgresql-connection}
-  (lambda (self sql)
-    (let* ((name (symbol->string (gensym 'stmt)))
-           ((values params cols)
-            (postgresql-prepare-statement! self name sql)))
-      (make-postgresql-statement name self params cols))))
+(defstruct (postgresql-command statement) (conn complete input token)
+  constructor: :init!
+  print: (complete))
 
-(defmethod {finalize postgresql-statement}
+(defstruct !unnamed () final: t)
+(def unnamed-command (make-!unnamed))
+
+(defmethod {:init! postgresql-command}
+  (lambda (self conn name: (name unnamed-command) complete: (complete #f))
+    (struct-instance-init! self name conn complete)))
+
+
+(defmethod {query-start postgresql-command} void)
+(defmethod {query-fini postgresql-command} postgresql-command::reset)
+(defmethod {query-fetch postgresql-command} (lambda _ iter-end))
+(defmethod {query-row postgresql-command} postgresql-command-complete)
+(defmethod {columns postgresql-command} (lambda _ '()))
+
+(defmethod {reset postgresql-command}
   (lambda (self)
-    (with ((postgresql-statement name conn) self)
-      (postgresql-statement::reset self)
-      (postgresql-close-statement! conn name))))
+    (alet (token (postgresql-command-token self))
+      (postgresql-reset! (postgresql-command-conn self) token)
+      (set! (postgresql-command-token self) #f)
+      (set! (postgresql-command-input self) #f))))
 
-(defmethod {bind postgresql-statement}
-  (lambda (self . args)
-    (def (value->binding type-oid arg)
-      (cond
-       ((not arg)
-        ;; #f is NULL normally ... unless it's a BOOL
-        (if (fx= type-oid 16)
-          (serialize-boolean arg)
-          #f))
-       ((string? arg) arg)
-       ((catalog-serializer (current-catalog) type-oid)
-        => (cut <> arg))
-       (else
-        (error "Cannot bind; unknown parameter type" type-oid arg))))
+(defstruct (postgresql-statement postgresql-command) (cols params bind row)
+  constructor: :init!
+  final: #t)
 
-    (let* ((params (postgresql-statement-params self))
-           (bind (map value->binding params args)))
-      (set! (postgresql-statement-bind self) bind)
-      (void))))
+(defmethod {:init! postgresql-statement}
+  (lambda (self conn name: (name unnamed-command)
+                cols params: (params []))
+    (struct-instance-init! self name conn #f #f #f cols params)))
 
-(defmethod {clear postgresql-statement}
+(defmethod {query-row postgresql-statement}
   (lambda (self)
-    (set! (postgresql-statement-bind self) #f)))
+    (postgresql-statement-row self)))
+(defmethod {columns postgresql-statement}
+   (lambda (self)
+     (map car (postgresql-statement-cols self))))
 
-(defmethod {reset postgresql-statement}
-  (lambda (self)
-    (alet (token (postgresql-statement-token self))
-      (postgresql-reset! (postgresql-statement-conn self) token)
-      (set! (postgresql-statement-token self) #f)
-      (set! (postgresql-statement-inp self) #f)
-      (set! (postgresql-statement-row self) #f))))
 
-(defmethod {exec postgresql-statement}
-  (lambda (self)
-    (with ((postgresql-statement name conn _ _ bind) self)
-      (postgresql-exec! conn name (or bind [])))))
+
+(defmethod {query-fini postgresql-statement}
+   postgresql-statement::reset)
+(def (postgresql-statement-in-query? stmt)
+  (!unnamed? (statement-e stmt)))
 
 (defmethod {query-start postgresql-statement}
   (lambda (self)
-    (with ((postgresql-statement name conn _ _ bind) self)
+    (unless (postgresql-statement-in-query? self)
+    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
       (let ((values inp token) (postgresql-query! conn name (or bind [])))
-        (set! (postgresql-statement-token self) token)
-        (set! (postgresql-statement-inp self) inp)
-        (set! (postgresql-statement-row self) #f)))))
+        (set! (postgresql-command-token self) token)
+        (set! (postgresql-command-input self) inp)
+        (set! (postgresql-statement-row self) #f))))))
 
 (defmethod {query-fetch postgresql-statement}
   (lambda (self)
@@ -208,20 +110,24 @@
        (else res)))
 
     (cond
-     ((postgresql-statement-inp self)
+     ((postgresql-command-input self)
       => (lambda (inp)
            (let again ()
              (let (next (channel-get inp))
                (cond
-                ((eof-object? next)
-                 (set! (postgresql-statement-token self) #f)
-                 (set! (postgresql-statement-inp self) #f)
+                ((or (eof-object? next) (void? next))
+                 (when (void? next)
+                   (let ((next (channel-get inp)))
+                     (set! (postgresql-command-complete self)
+                       (postgresql-message-args next))))
+                 (set! (postgresql-command-token self) #f)
+                 (set! (postgresql-command-input self) #f)
                  (set! (postgresql-statement-row self) #f)
                  iter-end)
                 ((exception? next)
                  (raise next))
                 ((query-token? next)
-                 (postgresql-continue! (postgresql-statement-conn self) next)
+                 (postgresql-continue! (postgresql-command-conn self) next)
                  (again))
                 (else
                  (let (row (result->row next))
@@ -229,16 +135,100 @@
                    (void))))))))
      (else iter-end))))
 
-(defmethod {query-row postgresql-statement}
+(defmethod {prepare postgresql-connection}
+  (lambda (self sql)
+    (let* ((name (symbol->string (gensym 'stmt)))
+           ((values params cols)
+            (postgresql-prepare-statement! self name sql)))
+      (make-postgresql-statement self name: name cols params: params))))
+(defmethod {bind postgresql-statement}
+  (lambda (self . args)
+    (def (value->binding type-oid arg)
+      (cond
+       ((not arg)
+        ;; #f is NULL normally ... unless it's a BOOL
+        (if (fx= type-oid 16)
+          (serialize-boolean arg)
+          #f))
+       ((string? arg) arg)
+       ((catalog-serializer (current-catalog) type-oid)
+        => (cut <> arg))
+       (else
+        (error "Cannot bind; Parameter type oid not in (current-catalog)" type-oid arg))))
+    (let* ((params (postgresql-statement-params self))
+           (bind (map value->binding params args)))
+      (set! (postgresql-statement-bind self) bind)
+      (void))))
+(defmethod {clear postgresql-statement}
   (lambda (self)
-    (postgresql-statement-row self)))
-
-(defmethod {query-fini postgresql-statement}
-  postgresql-statement::reset)
-
-(defmethod {columns postgresql-statement}
+    (set! (postgresql-statement-bind self) #f)))
+(defmethod {exec postgresql-statement}
   (lambda (self)
-    (map car (postgresql-statement-cols self))))
+    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
+      (let (comp (postgresql-exec! conn name (or bind [])))
+        (begin0 comp
+          (set! (postgresql-command-complete self) comp))))))
+(defmethod {finalize postgresql-statement}
+  (lambda (self)
+    (with ((postgresql-statement name conn) self)
+      (postgresql-statement::reset self)
+      (postgresql-close-statement! conn name))))
+(defmethod {reset postgresql-statement}
+  (lambda (self)
+    (postgresql-command::reset self)
+    (set! (postgresql-statement-row self) #f)))
+
+(defstruct (postgresql-query postgresql-command) (str cmd)
+  constructor: :init!
+  print: (str)
+  final: #t)
+
+(defmethod {:init! postgresql-query}
+  (lambda (self conn str)
+    (struct-instance-init! self unnamed-command conn #f #f #f str)))
+
+(defmethod {query-row postgresql-query} postgresql-query-cmd)
+(defmethod {query-start postgresql-query}
+  (lambda (self)
+    (with ((postgresql-query _ conn _ _ _ str) self)
+      (let ((values inp token) (postgresql-simple-query! conn str))
+        (set! (postgresql-command-token self) token)
+        (set! (postgresql-command-input self) inp)))))
+(defmethod {query-fetch postgresql-query}
+  (lambda (self)
+    (with ((postgresql-query _ conn _ inp token _ cmd) self)
+      (if (not inp) iter-end
+          (let again ()
+             (let (next (channel-get inp))
+               (cond
+                ((eof-object? next)
+                 (set! (postgresql-command-token self) #f)
+                 (set! (postgresql-command-input self) #f)
+                 iter-end)
+                ((exception? next)
+                 (raise next))
+                ((query-token? next)
+                 (postgresql-continue! (postgresql-command-conn self) next)
+                 (again))
+                ((postgresql-CommandComplete? next)
+                 (let ((comp (postgresql-message-args next)))
+                   (when cmd (set! (postgresql-command-input cmd) #f))
+                   (cond ((or (not cmd) (postgresql-command-complete cmd))
+                          (set! (postgresql-query-cmd self)
+                            (make-postgresql-command conn complete: comp)))
+                         (else
+                          (set! (postgresql-command-complete cmd) comp)
+                          (again))))
+                 (void))
+                ((postgresql-RowDescription? next)
+                 (let (stmt (make-postgresql-statement
+                             conn (postgresql-message-args next)))
+                   (set! (postgresql-command-input stmt) inp)
+                   ;; (set! (postgresql-command-token stmt) self)
+                   (set! (postgresql-query-cmd self) stmt))
+                 (void))
+                (else
+                 (again)))))))))
 
 ;;; catalog/pg_type.h
 (defstruct catalog (s d)
