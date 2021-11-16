@@ -16,7 +16,14 @@
         default-catalog
         current-catalog)
 
-(defstruct (postgresql-connection connection) () final: #t)
+(defstruct (postgresql-connection connection) (host port user db)
+  print: (host port user db)
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! postgresql-connection}
+  (lambda (self driver host port user db)
+    (struct-instance-init! self driver #f #f #f host port user db)))
 
 (def (postgresql-connect host: (host "127.0.0.1")
                          port: (port 5432)
@@ -24,7 +31,7 @@
                          passwd: passwd
                          db: (db #f))
   (let (driver (postgresql-connect! host port user passwd db))
-    (make-postgresql-connection driver)))
+    (make-postgresql-connection driver host port user db)))
 
 (defmethod {close postgresql-connection}
   (lambda (self)
@@ -70,7 +77,6 @@
 (defmethod {columns postgresql-statement}
    (lambda (self)
      (map car (postgresql-statement-cols self))))
-
 
 
 (defmethod {query-fini postgresql-statement}
@@ -172,20 +178,21 @@
   (lambda (self)
     (with ((postgresql-statement name conn) self)
       (postgresql-statement::reset self)
+      (set! (postgresql-command-complete self) #f)
       (postgresql-close-statement! conn name))))
 (defmethod {reset postgresql-statement}
   (lambda (self)
     (postgresql-command::reset self)
     (set! (postgresql-statement-row self) #f)))
 
-(defstruct (postgresql-query postgresql-command) (str cmd)
+(defstruct (postgresql-query postgresql-command) (str cmd greedy)
   constructor: :init!
-  print: (str)
+  print: (greedy str)
   final: #t)
 
 (defmethod {:init! postgresql-query}
   (lambda (self conn str)
-    (struct-instance-init! self unnamed-command conn #f #f #f str)))
+    (struct-instance-init! self unnamed-command conn #f #f #f str #f #t)))
 
 (defmethod {query-row postgresql-query} postgresql-query-cmd)
 (defmethod {query-start postgresql-query}
@@ -196,7 +203,8 @@
         (set! (postgresql-command-input self) inp)))))
 (defmethod {query-fetch postgresql-query}
   (lambda (self)
-    (with ((postgresql-query _ conn _ inp token _ cmd) self)
+    (def greedy-in #f)
+    (with ((postgresql-query _ conn _ inp token _ cmd greedy) self)
       (if (not inp) iter-end
           (let again ()
              (let (next (channel-get inp))
@@ -212,7 +220,11 @@
                  (again))
                 ((postgresql-CommandComplete? next)
                  (let ((comp (postgresql-message-args next)))
-                   (when cmd (set! (postgresql-command-input cmd) #f))
+                   (when (and cmd (not greedy-in))
+                     (set! (postgresql-command-input cmd) #f))
+                   (when greedy-in
+                     (channel-sync greedy-in next)
+                     (set! greedy-in #f))
                    (cond ((or (not cmd) (postgresql-command-complete cmd))
                           (set! (postgresql-query-cmd self)
                             (make-postgresql-command conn complete: comp)))
@@ -223,11 +235,17 @@
                 ((postgresql-RowDescription? next)
                  (let (stmt (make-postgresql-statement
                              conn (postgresql-message-args next)))
-                   (set! (postgresql-command-input stmt) inp)
-                   ;; (set! (postgresql-command-token stmt) self)
-                   (set! (postgresql-query-cmd self) stmt))
-                 (void))
+                   (set! (postgresql-query-cmd self) stmt)
+                   (set! cmd stmt)
+                   (cond ((not greedy)
+                          (set! (postgresql-command-input stmt) inp)
+                          (void))
+                         (else
+                          (set! greedy-in (make-channel))
+                          (set! (postgresql-command-input stmt) greedy-in)
+                          (again)))))
                 (else
+                 (when greedy-in (channel-sync greedy-in next))
                  (again)))))))))
 
 ;;; catalog/pg_type.h

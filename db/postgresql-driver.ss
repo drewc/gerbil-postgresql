@@ -364,30 +364,32 @@
        (apply raise-sql-error 'postgresql-query! msg irritants))))
 
   (def (query-pump)
-    ;; Execute ("")          -> DataRow ...
-    ;;                          CommandComplete | EmptyQueryResponse
-    ;;                          | ErrorResponse | PortalSuspended.
-    ;; Sync                  -> ReadyForQuery
-    (let/cc break
-      (let lp ()
-        (match (recv!)
-          (['DataRow . cols]
-           (cond
-            ((channel-try-put query-output cols)
-             (lp))
-            (else
-             (channel-sync query-output cols query-token)
-             (break))))
-          (['CommandComplete tag]
-           (void))
-          ([(or 'PortalSuspended 'EmptyQueryResponse)]
-           (void))
-          (['ErrorResponse msg . irritants]
-           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
-      (channel-close query-output)
-      (set! query-output #f)
-      (set! query-token #f)
-      (resync!)))
+      ;; Execute ("")          -> DataRow ...
+      ;;                          CommandComplete | EmptyQueryResponse
+      ;;                          | ErrorResponse | PortalSuspended.
+      ;; Sync                  -> ReadyForQuery
+      (let/cc break
+        (let lp ()
+          (match (recv!)
+            (['DataRow . cols]
+             (cond
+              ((channel-try-put query-output cols)
+               (lp))
+              (else
+               (channel-sync query-output cols query-token)
+               (break))))
+            (['CommandComplete tag]
+             (channel-sync query-output (void))
+             (channel-sync query-output (postgresql-CommandComplete tag))
+             (void))
+            ([(or 'PortalSuspended 'EmptyQueryResponse)]
+             (void))
+            (['ErrorResponse msg . irritants]
+             (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
+        (channel-close query-output)
+        (set! query-output #f)
+        (set! query-token #f)
+        (resync!)))
 
   (def (simple-query-start str)
       (maybe-sync!)

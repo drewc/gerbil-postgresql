@@ -2,6 +2,7 @@
 
 https://www.postgresql.org/docs/13/protocol-message-formats.html
 
+
 * Add "simple query"
 
 Here's the thing. Postgresql can take a string that has multiple statements as a
@@ -478,6 +479,38 @@ Statements can be prepared ahead of time.
 
 #+end_src
 
+** ~query-pump~
+
+#+begin_src scheme :noweb-ref query-pump
+(def (query-pump)
+    ;; Execute ("")          -> DataRow ...
+    ;;                          CommandComplete | EmptyQueryResponse
+    ;;                          | ErrorResponse | PortalSuspended.
+    ;; Sync                  -> ReadyForQuery
+    (let/cc break
+      (let lp ()
+        (match (recv!)
+          (['DataRow . cols]
+           (cond
+            ((channel-try-put query-output cols)
+             (lp))
+            (else
+             (channel-sync query-output cols query-token)
+             (break))))
+          (['CommandComplete tag]
+           (channel-sync query-output (void))
+           (channel-sync query-output (postgresql-CommandComplete tag))
+           (void))
+          ([(or 'PortalSuspended 'EmptyQueryResponse)]
+           (void))
+          (['ErrorResponse msg . irritants]
+           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
+      (channel-close query-output)
+      (set! query-output #f)
+      (set! query-token #f)
+      (resync!)))
+#+end_src
+
 * Front End
 
 ** Connection
@@ -488,7 +521,14 @@ Statements can be prepared ahead of time.
 We need to connect to a server. Time to sub [[file:dbi.org::#connectionStruct][Connection]].
 
 #+begin_src scheme :noweb-ref postgresql-connection
-(defstruct (postgresql-connection connection) () final: #t)
+(defstruct (postgresql-connection connection) (host port user db)
+  print: (host port user db)
+  constructor: :init!
+  final: #t)
+
+(defmethod {:init! postgresql-connection}
+  (lambda (self driver host port user db)
+    (struct-instance-init! self driver #f #f #f host port user db)))
 
 (def (postgresql-connect host: (host "127.0.0.1")
                          port: (port 5432)
@@ -496,7 +536,7 @@ We need to connect to a server. Time to sub [[file:dbi.org::#connectionStruct][C
                          passwd: passwd
                          db: (db #f))
   (let (driver (postgresql-connect! host port user passwd db))
-    (make-postgresql-connection driver)))
+    (make-postgresql-connection driver host port user db)))
 
 (defmethod {close postgresql-connection}
   (lambda (self)
@@ -595,7 +635,6 @@ As are columns.
    (lambda (self)
      (map car (postgresql-statement-cols self))))
 
-
 #+end_src
 
 And to ~-fini~'sh it up we just reset it
@@ -668,6 +707,7 @@ set that and return it.
   (lambda (self)
     (with ((postgresql-statement name conn) self)
       (postgresql-statement::reset self)
+      (set! (postgresql-command-complete self) #f)
       (postgresql-close-statement! conn name))))
 #+end_src
 
@@ -757,14 +797,14 @@ There are a few different types of statements. When one is fetched from a [[#fro
 :END:
 
 #+begin_src scheme :noweb-ref query struct
-(defstruct (postgresql-query postgresql-command) (str cmd)
+(defstruct (postgresql-query postgresql-command) (str cmd greedy)
   constructor: :init!
-  print: (str)
+  print: (greedy str)
   final: #t)
 
 (defmethod {:init! postgresql-query}
   (lambda (self conn str)
-    (struct-instance-init! self unnamed-command conn #f #f #f str)))
+    (struct-instance-init! self unnamed-command conn #f #f #f str #f #t)))
 #+end_src
 
 The [[file:dbi.org::#statementIter][Iterate]] procedure needs 4 methods.
@@ -802,7 +842,8 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
 #+begin_src scheme :noweb-ref query query
 (defmethod {query-fetch postgresql-query}
   (lambda (self)
-    (with ((postgresql-query _ conn _ inp token _ cmd) self)
+    (def greedy-in #f)
+    (with ((postgresql-query _ conn _ inp token _ cmd greedy) self)
       (if (not inp) iter-end
           (let again ()
              (let (next (channel-get inp))
@@ -818,7 +859,11 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
                  (again))
                 ((postgresql-CommandComplete? next)
                  (let ((comp (postgresql-message-args next)))
-                   (when cmd (set! (postgresql-command-input cmd) #f))
+                   (when (and cmd (not greedy-in))
+                     (set! (postgresql-command-input cmd) #f))
+                   (when greedy-in
+                     (channel-sync greedy-in next)
+                     (set! greedy-in #f))
                    (cond ((or (not cmd) (postgresql-command-complete cmd))
                           (set! (postgresql-query-cmd self)
                             (make-postgresql-command conn complete: comp)))
@@ -829,11 +874,17 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
                 ((postgresql-RowDescription? next)
                  (let (stmt (make-postgresql-statement
                              conn (postgresql-message-args next)))
-                   (set! (postgresql-command-input stmt) inp)
-                   ;; (set! (postgresql-command-token stmt) self)
-                   (set! (postgresql-query-cmd self) stmt))
-                 (void))
+                   (set! (postgresql-query-cmd self) stmt)
+                   (set! cmd stmt)
+                   (cond ((not greedy)
+                          (set! (postgresql-command-input stmt) inp)
+                          (void))
+                         (else
+                          (set! greedy-in (make-channel))
+                          (set! (postgresql-command-input stmt) greedy-in)
+                          (again)))))
                 (else
+                 (when greedy-in (channel-sync greedy-in next))
                  (again)))))))))
 #+end_src
 
@@ -1233,31 +1284,7 @@ We may need to continue with one of our pumps.
        (resync!)
        (apply raise-sql-error 'postgresql-query! msg irritants))))
 
-  (def (query-pump)
-    ;; Execute ("")          -> DataRow ...
-    ;;                          CommandComplete | EmptyQueryResponse
-    ;;                          | ErrorResponse | PortalSuspended.
-    ;; Sync                  -> ReadyForQuery
-    (let/cc break
-      (let lp ()
-        (match (recv!)
-          (['DataRow . cols]
-           (cond
-            ((channel-try-put query-output cols)
-             (lp))
-            (else
-             (channel-sync query-output cols query-token)
-             (break))))
-          (['CommandComplete tag]
-           (void))
-          ([(or 'PortalSuspended 'EmptyQueryResponse)]
-           (void))
-          (['ErrorResponse msg . irritants]
-           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
-      (channel-close query-output)
-      (set! query-output #f)
-      (set! query-token #f)
-      (resync!)))
+  <<query-pump>>
 
   <<simple-query-start>>
 
