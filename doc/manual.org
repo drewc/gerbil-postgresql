@@ -1,0 +1,272 @@
+#+TITLE: Gerbil PostgreSQL Manual
+
+* Introduction
+
+Gerbil has a great postgresql interface. While for the most part one will access
+and use the database with the [[file:db.org::*Generic Database Interface][Generic Database Interface]], PostgreSQL is a lot
+more than an SQL database and has different usages.
+
+This is where the underlying implementation is documented along with usage of the generic interface.
+
+#+begin_src scheme
+(import :drewc/db/dbi :drewc/db/postgresql
+        :std/iter)
+#+end_src
+
+** Testing
+
+In this manual there's a of ~check~ statements.
+
+* Connection
+
+First we need a connection to the database.
+
+
+The best and recommended way is to use [[file:db.org::#sql-connect][~sql-connect~]] as it ~will~'s the close so
+you don't need to bother. For that we also need [[file:db.org::#postgresql-connect][~postgresql-connect~]].
+
+#+begin_src scheme :noweb-ref define connections
+(def db (sql-connect postgresql-connect
+                     host: "localhost"
+                     port: 5432
+                     user: "test"
+                     passwd: "test"
+                     db: "test"))
+#+end_src
+
+That's enough to continue.
+
+#+begin_src scheme
+(extern pretty-print)
+(pretty-print db)
+
+=> #<postgresql-connection #38
+     host: "localhost"
+     port: 5432
+     user: "test"
+     db: "test">
+#+end_src
+
+** Details
+
+That ~pg~ is in fact a [[file:~/me/src/gerbil-postgresql/db/dbi.org::*Connection][Connection]] that encapsulates a driver.
+
+#+begin_src scheme :noweb-ref db tests
+(check db ? connection?)
+#+end_src
+
+We can get the "driver" with ~connection-e~.
+
+#+begin_src scheme :noweb-ref define connections
+(def pg (connection-e db))
+#+end_src
+
+A driver is in fact a thread.
+
+#+begin_src scheme :noweb-ref pg tests
+(check pg ? thread?)
+#+end_src
+
+
+* Generic Database Interface
+
+Most of the time we simply want to use it as a database inside another
+application and care not about PostgreSQL specifics. The [[file:db.org::*Generic Database Interface][Generic Database
+Interface]] takes care of that for us.
+
+** Prepare, bind, query, and exec
+
+The ~sql-exec~ procedure always returns ~(void)~. Let's create a table.
+
+#+begin_src scheme :noweb-ref db tests
+(let (stmt (sql-prepare db "CREATE TABLE Users (FirstName VARCHAR, LastName VARCHAR, Secret VARCHAR)"))
+  (check (sql-exec stmt) ? void?)
+  (sql-finalize stmt))
+#+end_src
+
+We can create transactions. Let's try one to insert.
+
+#+begin_src scheme :noweb-ref db tests
+(let (stmt (sql-prepare db "INSERT INTO Users (FirstName, LastName, Secret) VALUES ($1, $2, $3)"))
+  (sql-txn-begin db)
+  (sql-bind stmt "John" "Smith" "very secret")
+  (check (sql-exec stmt) ? void?)
+  (sql-bind stmt "Marc" "Smith" "oh so secret")
+  (check (sql-exec stmt) ? void?)
+  (sql-txn-commit db)
+  (sql-finalize stmt))
+#+end_src
+
+*** ~sql-query~
+
+The procedure ~sql-query~ iterates over the "statement" and collects the
+results.
+
+#+begin_src scheme :noweb-ref db tests
+(let (stmt (sql-prepare db "SELECT * FROM Users"))
+  (check (sql-query stmt) => '(#("John" "Smith" "very secret")
+                               #("Marc" "Smith" "oh so secret")))
+  (sql-finalize stmt))
+#+end_src
+
+*** Dive deeper: ~postgresql-command-complete~
+
+A statement is in fact a [[#pgCommand][~postgresql-command~]]. That's relevant if you want to know what the database returns.
+
+At the same time, when a statement is finalized, it is "new", and not complete.
+
+#+begin_src scheme :noweb-ref db tests
+(let* (stmt (sql-prepare db "SELECT * FROM Users"))
+  (check (postgresql-command-complete stmt) => #f)
+  (check (sql-query stmt) => '(#("John" "Smith" "very secret")
+                               #("Marc" "Smith" "oh so secret")))
+  (check (postgresql-command-complete stmt) => "SELECT 2")
+  (sql-finalize stmt)
+  (check (postgresql-command-complete stmt) => #f))
+#+end_src
+
+
+*** Iterate: ~:std/iter~ and ~:iter~
+
+We can manually do what ~sql-query~ does. This uses the ~:std/iter~ module.
+
+#+begin_src scheme :noweb-ref db tests
+(let (stmt (sql-prepare db "SELECT * FROM Users WHERE FirstName = $1"))
+  (sql-bind stmt "John")
+  (check (for/collect (res (:iter stmt)) res)
+     => '(#("John" "Smith" "very secret")))
+  (check (postgresql-command-complete stmt) => "SELECT 1")
+  (sql-finalize stmt))
+#+end_src
+
+Only at the end of iteration is the command complete.
+
+#+begin_src scheme :noweb-ref db tests
+(let* ((stmt (sql-prepare db "SELECT FirstName FROM Users"))
+       (iter (:iter stmt)))
+  (check (iter-next! iter) => "John")
+  (check (postgresql-command-complete stmt) => #f)
+  (check (iter-next! iter) => "Marc")
+  (check (postgresql-command-complete stmt) => #f)
+  (check (iter-next! iter) ? iter-end?)
+  (check (postgresql-command-complete stmt) => "SELECT 2")
+  (sql-finalize stmt)
+  (check (postgresql-command-complete stmt) => #f))
+#+end_src
+
+
+** Eval: The quick and easy way
+
+Often times we do not need to know what postgres says when the command is
+complete. ~sql-eval~ and ~sql-eval-query~ to the rescue.
+
+First eval a query.
+
+#+begin_src scheme :noweb-ref db tests
+(let (res (sql-eval-query db "SELECT * FROM Users"))
+  (check res => '(#("John" "Smith" "very secret")
+                  #("Marc" "Smith" "oh so secret"))))
+#+end_src
+
+Now a simple command is executed.
+
+#+begin_src scheme :noweb-ref db tests
+(let (res (sql-eval db "DELETE FROM Users WHERE FirstName = $1"
+                    "Marc"))
+  (check res ? void?))
+#+end_src
+
+Now let's make sure it worked.
+
+#+begin_src scheme :noweb-ref db tests
+(let (res (sql-eval-query db "SELECT * FROM Users"))
+  (check res => '(#("John" "Smith" "very secret"))))
+#+end_src
+
+And we're done.
+
+#+begin_src scheme :noweb-ref db tests
+(sql-eval db "DROP TABLE Users")
+#+end_src
+
+
+* "Simple" Query: Complex Interaction
+
+#+begin_quote
+A simple query cycle is initiated by the frontend sending a Query message to the backend. The message includes an SQL command (or commands) expressed as a text string.
+ --https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
+#+end_quote
+
+Sometimes we want to interact with the database with more-specific less-generic requirements. This is where that comes in.
+
+If we just want one command at a time and don't want to prepare it manually we can so do with a ~postgresql-query~ command.
+
+#+begin_src scheme :noweb-ref sq tests
+
+
+
+#+end_src
+
+
+
+
+
+** ~postgresql-command~
+:PROPERTIES:
+:CUSTOM_ID: pgCommand
+:END:
+
+* Testing
+
+The ~:std/test~ is used. See here for details: [[file:test.org][Test Documentation]].
+
+For testing creation we may (gasp!) need a different database connection than
+upstream provides for the test suite.
+
+#+begin_src scheme :noweb-ref create testdb
+(def (create-test-user-and-database
+      host: (h "localhost")
+      port: (p 5432)
+      user: (u "postgres")
+      passwd: (pw "heh"))
+  (def db (sql-connect postgresql-connect host: h port: p user: u passwd: pw))
+  (try (sql-eval db "CREATE ROLE test PASSWORD 'test' LOGIN")
+       (catch (e) (display-exception e)))
+ (try (sql-eval db "CREATE DATABASE test OWNER test")
+       (catch (e) (display-exception e))))
+#+end_src
+
+
+
+#+begin_src scheme :noweb yes
+(import :std/test :std/iter
+        :drewc/db/dbi
+        :drewc/db/postgresql-driver
+        :drewc/db/postgresql
+        :std/misc/channel
+        :std/misc/plist
+        :std/sugar)
+(export postgresql-test
+        create-test-user-and-database
+        pg-plist)
+
+<<create testdb>>
+
+<<pg-plist>>
+
+<<define connections>>
+
+(def postgresql-test
+  (test-suite "test: db/postgresql"
+    <<define connections>>
+    (test-case "test: postgresql driver"
+      <<pg tests>>)
+    (test-case "test: postgresql Generic DBI"
+      (try
+       (let (stmt (sql-prepare db "DROP TABLE Users"))
+         (sql-exec stmt))
+       (catch (sql-error? e) (void)))
+      <<db tests>>)))
+
+
+#+end_src

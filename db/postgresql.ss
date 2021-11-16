@@ -65,7 +65,7 @@
 (defstruct (postgresql-statement postgresql-command) (cols params bind row)
   constructor: :init!
   final: #t)
-
+(defalias postgresql-statement-name statement-e)
 (defmethod {:init! postgresql-statement}
   (lambda (self conn name: (name unnamed-command)
                 cols params: (params []))
@@ -191,8 +191,8 @@
   final: #t)
 
 (defmethod {:init! postgresql-query}
-  (lambda (self conn str)
-    (struct-instance-init! self unnamed-command conn #f #f #f str #f #t)))
+  (lambda (self conn str greedy: (greedy #t))
+    (struct-instance-init! self unnamed-command conn #f #f #f str #f greedy)))
 
 (defmethod {query-row postgresql-query} postgresql-query-cmd)
 (defmethod {query-start postgresql-query}
@@ -212,6 +212,7 @@
                 ((eof-object? next)
                  (set! (postgresql-command-token self) #f)
                  (set! (postgresql-command-input self) #f)
+                 (set! (postgresql-command-complete self) #t)
                  iter-end)
                 ((exception? next)
                  (raise next))
@@ -229,9 +230,13 @@
                           (set! (postgresql-query-cmd self)
                             (make-postgresql-command conn complete: comp)))
                          (else
-                          (set! (postgresql-command-complete cmd) comp)
-                          (again))))
-                 (void))
+                          (set! (postgresql-command-complete cmd) comp)))
+                   (cond ((not greedy)
+                            (set! (postgresql-query-cmd self) #f)
+                            (set! cmd #f)
+                            (again))
+                         (else 
+                          (void)))))
                 ((postgresql-RowDescription? next)
                  (let (stmt (make-postgresql-statement
                              conn (postgresql-message-args next)))

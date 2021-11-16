@@ -1,0 +1,325 @@
+#+TITLE: Testing
+
+The =:std/test= library provides a lightweight testing framework.
+
+#+begin_src scheme
+(import :std/test)
+#+end_src
+
+::: tip usage  :::
+
+** Overview
+   :PROPERTIES:
+   :CUSTOM_ID: overview
+   :END:
+
+
+
+** Interface
+   :PROPERTIES:
+   :CUSTOM_ID: interface
+   :END:
+
+*** test-suite
+    :PROPERTIES:
+    :CUSTOM_ID: test-suite
+    :END:
+
+    A test suite is way of gathering tests under a description.
+
+
+    #+begin_src scheme
+(def sweet (test-suite "heh" (check 'heh => 'heh)))
+    #+end_src
+
+    A suite can be run.
+
+    #+begin_src scheme
+(run-test-suite! sweet)
+Test suite: heh
+... check 'heh is equal? to heh
+... All tests OK
+#t
+    #+end_src
+
+    It can contain cases.
+
+    #+begin_src scheme
+    #+end_src
+
+*** test-case
+    :PROPERTIES:
+    :CUSTOM_ID: test-case
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (test-case ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check
+    :PROPERTIES:
+    :CUSTOM_ID: check
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** checkf
+    :PROPERTIES:
+    :CUSTOM_ID: checkf
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (checkf ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-eq?
+    :PROPERTIES:
+    :CUSTOM_ID: check-eq
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-eq? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-not-eq?
+    :PROPERTIES:
+    :CUSTOM_ID: check-not-eq
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-not-eq? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-eqv?
+    :PROPERTIES:
+    :CUSTOM_ID: check-eqv
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-eqv? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-not-eqv?
+    :PROPERTIES:
+    :CUSTOM_ID: check-not-eqv
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-not-eqv? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-equal?
+    :PROPERTIES:
+    :CUSTOM_ID: check-equal
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-equal? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-not-equal?
+    :PROPERTIES:
+    :CUSTOM_ID: check-not-equal
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-not-equal? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-output
+    :PROPERTIES:
+    :CUSTOM_ID: check-output
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-output ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-predicate
+    :PROPERTIES:
+    :CUSTOM_ID: check-predicate
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-predicate ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** check-exception
+    :PROPERTIES:
+    :CUSTOM_ID: check-exception
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (check-exception ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** !check-fail?
+    :PROPERTIES:
+    :CUSTOM_ID: check-fail
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (!check-fail? ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** !check-fail-e
+    :PROPERTIES:
+    :CUSTOM_ID: check-fail-e
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (!check-fail-e ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** run-tests!
+    :PROPERTIES:
+    :CUSTOM_ID: run-tests
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (run-tests! ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** test-report-summary!
+    :PROPERTIES:
+    :CUSTOM_ID: test-report-summary
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (test-report-summary! ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** run-test-suite!
+    :PROPERTIES:
+    :CUSTOM_ID: run-test-suite
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (run-test-suite! ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+*** test-result
+    :PROPERTIES:
+    :CUSTOM_ID: test-result
+    :END:
+
+::: tip usage
+
+#+BEGIN_EXAMPLE
+  (test-result ...)
+#+END_EXAMPLE
+
+:::
+
+Please document me!
+
+** Example
+   :PROPERTIES:
+   :CUSTOM_ID: example
+   :END:
+
+Please write me!
