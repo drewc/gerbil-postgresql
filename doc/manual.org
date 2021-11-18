@@ -10,7 +10,7 @@ This is where the underlying implementation is documented along with usage of th
 
 #+begin_src scheme
 (import :drewc/db/dbi :drewc/db/postgresql
-        :std/iter)
+        :std/iter :std/error :gerbil/gambit/threads)
 #+end_src
 
 ** Testing
@@ -25,7 +25,7 @@ First we need a connection to the database.
 The best and recommended way is to use [[file:db.org::#sql-connect][~sql-connect~]] as it ~will~'s the close so
 you don't need to bother. For that we also need [[file:db.org::#postgresql-connect][~postgresql-connect~]].
 
-#+begin_src scheme :noweb-ref define connections
+#+begin_src scheme :noweb-ref define connection
 (def db (sql-connect postgresql-connect
                      host: "localhost"
                      port: 5432
@@ -57,16 +57,15 @@ That ~pg~ is in fact a [[file:~/me/src/gerbil-postgresql/db/dbi.org::*Connection
 
 We can get the "driver" with ~connection-e~.
 
-#+begin_src scheme :noweb-ref define connections
+#+begin_src scheme :noweb-ref def pg
 (def pg (connection-e db))
 #+end_src
 
 A driver is in fact a thread.
 
-#+begin_src scheme :noweb-ref pg tests
+#+begin_src scheme :noweb-ref def pg
 (check pg ? thread?)
 #+end_src
-
 
 * Generic Database Interface
 
@@ -189,7 +188,6 @@ And we're done.
 (sql-eval db "DROP TABLE Users")
 #+end_src
 
-
 * "Simple" Query: Complex Interaction
 
 #+begin_quote
@@ -197,17 +195,60 @@ A simple query cycle is initiated by the frontend sending a Query message to the
  --https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
 #+end_quote
 
-Sometimes we want to interact with the database with more-specific less-generic requirements. This is where that comes in.
+Sometimes we want to interact with the database with more-specific less-generic requirements. This is where that comes in, with a ~postgresql-query~ command.
 
-If we just want one command at a time and don't want to prepare it manually we can so do with a ~postgresql-query~ command.
+If we just want one command at a time and don't want to prepare it manually we can do so and see the extra "layer".
+
+First, a simple util to make a ~(<complete> . plist) from a command.
 
 #+begin_src scheme :noweb-ref sq tests
-
-
-
+(def (plist<-sql-query cmd)
+  (cons (postgresql-command-complete cmd)
+        (map (lambda (row) (map cons (sql-columns cmd)
+                                (if (vector? row)
+                                       (vector->list row)
+                                       (list row))))
+             (sql-query cmd))))
 #+end_src
 
+Now a string with commands separated by a semicolon becomes a ~postgresql-query~
+which can then be ~sql-query~'d. Querying a query results in returned commands
+which can also be queried
 
+#+begin_src scheme :noweb-ref sq tests
+(let* ((q (postgresql-query db "DROP TABLE IF EXISTS Users;
+ CREATE TABLE Users (FirstName VARCHAR, LastName VARCHAR, Secret VARCHAR);
+ INSERT INTO Users (FirstName) VALUES ('foo'), ('bar') RETURNING 'bar' AS foo;
+ SELECT * FROM Users;
+ SELECT * FROM Users LIMIT 1;
+ SELECT count(*) FROM Users;
+ DROP TABLE Users;"))
+       (qres (sql-query q))
+       (res
+        (map plist<-sql-query qres)))
+  (match res
+    ([drop create ins sel1 sel2 sel3 drop2]
+     (check (car drop) => "DROP TABLE")
+     (check (cdr drop) ? null?)
+     (check (car create) => "CREATE TABLE")
+     (check (cdr create) ? null?)
+     (check (car ins) => "INSERT 0 2")
+     (check (cadr ins) => '(("foo" . "bar")))
+     (check (caddr ins) => '(("foo" . "bar")))
+     (check (car sel1) => "SELECT 2")
+     (check (cadr sel1) => '(("firstname" . "foo") ("lastname" . #f) ("secret" . #f)))
+     (check (caddr sel1) => '(("firstname" . "bar") ("lastname" . #f) ("secret" . #f)))
+     (check (cdddr sel1) ? null?)
+     (check (car sel2) => "SELECT 1")
+     (check (cadr sel2) => '(("firstname" . "foo") ("lastname" . #f) ("secret" . #f)))
+     (check (cddr sel2) ? null?)
+     (check (car sel3) => "SELECT 1")
+     (check (cadr sel3) => '(("count" . 2)))
+     (check (car drop2) => "DROP TABLE")
+     (check (cdr drop2) ? null?))))
+#+end_src
+
+** Not greedy? Throw away the results.
 
 
 
@@ -215,6 +256,85 @@ If we just want one command at a time and don't want to prepare it manually we c
 :PROPERTIES:
 :CUSTOM_ID: pgCommand
 :END:
+
+* PostgreSQL Driver
+
+#+begin_src scheme :noweb-ref pg tests
+(def pg (postgresql-connect! "127.0.0.1" 5432 "test" "test" #f))
+(def (values? . args)
+  (lambda (res)
+    (equal? (values->list res) args)))
+(def (query-count-results res)
+  (let ((values inp token) res)
+    (let lp ((i 0))
+      (let (next (channel-get inp))
+        (cond
+         ((or (eof-object? next) (void? next)) i)
+         ((query-token? next)
+          (postgresql-continue! pg next)
+          (lp i))
+         ((exception? next)
+          (raise next))
+         (else
+          (lp (fx1+ i))))))))
+(def (query-results res)
+  (let ((values inp token) res)
+    (let lp ((r []))
+      (let (next (channel-get inp))
+        (cond
+         ((or (void? next) (eof-object? next))
+          (reverse r))
+         ((query-token? next)
+          (postgresql-continue! pg next)
+          (lp r))
+         ((exception? next)
+          (raise next))
+         (else
+          (lp (cons next r))))))))
+(def (genstring g)
+  (symbol->string
+   (gensym g)))
+
+(def (insert2k)
+  ;; this needs to be more than query-limit in the driver (current 1k)
+  (let lp ((i 0))
+    (when (fx< i 2000)
+      (postgresql-exec! pg "stmt3" [(genstring 'first) (genstring 'last) (genstring 'secret)])
+      (lp (fx1+ i)))))
+
+(check (postgresql-prepare-statement! pg "stmt0" "DROP TABLE Users")
+        ? (values? [] []))
+(check (try (postgresql-exec! pg "stmt0" []) (void) (catch (sql-error? e) (void)))
+       ? void?)
+(check (postgresql-prepare-statement! pg "stmt1" "CREATE TABLE Users (FirstName VARCHAR, LastName VARCHAR, Secret VARCHAR)")
+       ? (values? [] []))
+(check (postgresql-exec! pg "stmt1" [])
+       => "CREATE TABLE")
+(check (postgresql-prepare-statement! pg "stmt2" "SELECT * FROM Users")
+       ? (lambda (res)
+           (let ((values params cols) res)
+             (and (null? params)
+                  (equal? '("firstname" "lastname" "secret") (map car cols))))))
+(check (query-count-results
+        (postgresql-query! pg "stmt2" []))
+       => 0)
+(check (postgresql-prepare-statement! pg "stmt3" "INSERT INTO Users (FirstName, LastName, Secret) VALUES ($1, $2, $3)")
+       ? (values? [1043 1043 1043] []))
+(check (postgresql-exec! pg "stmt3" ["John" "Smith" "very secret"])
+       => "INSERT 0 1")
+(check (query-results
+        (postgresql-query! pg "stmt2" []))
+       => '(("John" "Smith" "very secret")))
+(check (insert2k) ? void?)
+(check (query-count-results
+        (postgresql-query! pg "stmt2" []))
+       => 2001)
+(check (postgresql-exec! pg "stmt0" [])
+       => "DROP TABLE")
+(postgresql-close! pg)
+
+
+#+end_src
 
 * Testing
 
@@ -238,35 +358,36 @@ upstream provides for the test suite.
 
 
 
-#+begin_src scheme :noweb yes
+#+begin_src scheme :noweb yes :tangle ../db/postgresql-test.ss
 (import :std/test :std/iter
         :drewc/db/dbi
         :drewc/db/postgresql-driver
         :drewc/db/postgresql
         :std/misc/channel
         :std/misc/plist
-        :std/sugar)
+        :std/sugar
+        :std/error
+        :gerbil/gambit/threads
+        :gerbil/gambit/exceptions)
 (export postgresql-test
-        create-test-user-and-database
-        pg-plist)
+        create-test-user-and-database)
 
 <<create testdb>>
 
-<<pg-plist>>
-
-<<define connections>>
-
 (def postgresql-test
   (test-suite "test: db/postgresql"
-    <<define connections>>
     (test-case "test: postgresql driver"
       <<pg tests>>)
     (test-case "test: postgresql Generic DBI"
+      <<define connection>>
       (try
        (let (stmt (sql-prepare db "DROP TABLE Users"))
          (sql-exec stmt))
        (catch (sql-error? e) (void)))
-      <<db tests>>)))
+      <<db tests>>)
+    (test-case "test: postgresql-query"
+      <<define connection>>
+      <<sq tests>>)))
 
 
 #+end_src

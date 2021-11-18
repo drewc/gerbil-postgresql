@@ -17,19 +17,12 @@
   sql-exec sql-query in-sql-query sql-columns
   sql-txn-begin sql-txn-commit sql-txn-abort)
 
-
 (defstruct connection (e txn-begin txn-commit txn-abort)
   constructor: :init!)
-(defstruct statement (e))
 
 (defmethod {:init! connection}
   (lambda (self e)
     (struct-instance-init! self e)))
-
-(defstruct (sql-error <error>) ())
-
-(def (raise-sql-error where what . irritants)
-  (raise (make-sql-error what irritants where)))
 
 (def (sql-connect connect . args)
   (let (conn (apply connect args))
@@ -55,6 +48,14 @@
 
 (defmethod {destroy connection}
   sql-close)
+
+(defstruct statement (e))
+(defstruct (sql-error <error>) ())
+
+(def (raise-sql-error where what . irritants)
+  (raise (make-sql-error what irritants where)))
+
+
 
 (def (sql-txn-do conn sql getf setf)
   (with ((connection e) conn)
@@ -138,6 +139,7 @@
   (for/collect (row (in-sql-query stmt)) row))
 
 ;;; iterators
+
 (defmethod (:iter (stmt statement))
   (in-sql-query stmt))
 
@@ -161,6 +163,7 @@
       {query-start stmt}
       it)
     (error "Invalid operation; statement finalized" stmt)))
+
 
 ;;; metadata
 (def (sql-columns stmt)

@@ -67,6 +67,29 @@ Because everything is a statement we just need a way to iterate over the
 results. How/where they come to us is a mystery that simplicity solves.
 
 #+begin_src scheme :noweb-ref iter sql statement
+(defmethod (:iter (stmt statement))
+  (in-sql-query stmt))
+
+(def (in-sql-query stmt)
+  (def (next it)
+    (with ((iterator stmt) it)
+      (let (r {query-fetch stmt})
+        (if (iter-end? r)
+          iter-end
+          {query-row stmt}))))
+
+  (def (fini it)
+    (with ((iterator stmt) it)
+      (when stmt
+        {query-fini stmt}
+        (set! (iterator-e it) #f))))
+
+  (if (statement-e stmt)
+    (let (it (make-iterator stmt next fini))
+      (make-will it fini)
+      {query-start stmt}
+      it)
+    (error "Invalid operation; statement finalized" stmt)))
 #+end_src
 
 
@@ -93,7 +116,6 @@ results. How/where they come to us is a mystery that simplicity solves.
 <<defstruct connection>>
 
 <<define statement>>
-
 (defstruct (sql-error <error>) ())
 
 (def (raise-sql-error where what . irritants)
@@ -183,29 +205,9 @@ results. How/where they come to us is a mystery that simplicity solves.
   (for/collect (row (in-sql-query stmt)) row))
 
 ;;; iterators
-(defmethod (:iter (stmt statement))
-  (in-sql-query stmt))
 
-(def (in-sql-query stmt)
-  (def (next it)
-    (with ((iterator stmt) it)
-      (let (r {query-fetch stmt})
-        (if (iter-end? r)
-          iter-end
-          {query-row stmt}))))
+<<iter sql statement>>
 
-  (def (fini it)
-    (with ((iterator stmt) it)
-      (when stmt
-        {query-fini stmt}
-        (set! (iterator-e it) #f))))
-
-  (if (statement-e stmt)
-    (let (it (make-iterator stmt next fini))
-      (make-will it fini)
-      {query-start stmt}
-      it)
-    (error "Invalid operation; statement finalized" stmt)))
 
 ;;; metadata
 (def (sql-columns stmt)

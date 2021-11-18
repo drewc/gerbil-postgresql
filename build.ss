@@ -4,4 +4,5 @@
 (import :std/build-script)
 
 (defbuild-script
-  '("db/postgresql-driver" "db/postgresql" "db/dbi"))
+  '("db/postgresql-driver" "db/postgresql" "db/dbi"
+    "db/postgresql-test" "db/postgresql-upstream-test"))

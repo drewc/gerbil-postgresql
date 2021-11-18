@@ -1,9 +1,15 @@
 #+TITLE: PostgreSQL
 
-https://www.postgresql.org/docs/13/protocol-message-formats.html
 
 
-* Add "simple query"
+* Introduction: Add "simple query"
+
+This is how I started learning *vyzo*'s genius implementation along with adding
+to it.
+
+If you already know enough, see [[#frontEnd][Front End]] and [[#backEnd][The Backend Driver]].
+
+Otherwise.
 
 Here's the thing. Postgresql can take a string that has multiple statements as a
 single query.
@@ -19,7 +25,7 @@ processing the query string. ReadyForQuery is issued when the entire string has
 been processed and the backend is ready to accept a new query string.
 #+end_quote
 
-In the driver it is this.
+In the driver it is now this.
 
 #+begin_src scheme :noweb-ref postgresql-simple-query
 (def (postgresql-simple-query! conn str)
@@ -471,47 +477,10 @@ We'll try a query with 4 commands.
             (map (cut map cons {columns cmd} <>) (map vector->list o)))))))
 #+end_src
 
-* Prepared Statements
-
-Statements can be prepared ahead of time.
-
-#+begin_src scheme
-
-#+end_src
-
-** ~query-pump~
-
-#+begin_src scheme :noweb-ref query-pump
-(def (query-pump)
-    ;; Execute ("")          -> DataRow ...
-    ;;                          CommandComplete | EmptyQueryResponse
-    ;;                          | ErrorResponse | PortalSuspended.
-    ;; Sync                  -> ReadyForQuery
-    (let/cc break
-      (let lp ()
-        (match (recv!)
-          (['DataRow . cols]
-           (cond
-            ((channel-try-put query-output cols)
-             (lp))
-            (else
-             (channel-sync query-output cols query-token)
-             (break))))
-          (['CommandComplete tag]
-           (channel-sync query-output (void))
-           (channel-sync query-output (postgresql-CommandComplete tag))
-           (void))
-          ([(or 'PortalSuspended 'EmptyQueryResponse)]
-           (void))
-          (['ErrorResponse msg . irritants]
-           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
-      (channel-close query-output)
-      (set! query-output #f)
-      (set! query-token #f)
-      (resync!)))
-#+end_src
-
 * Front End
+:PROPERTIES:
+:CUSTOM_ID: frontEnd
+:END:
 
 ** Connection
 :PROPERTIES:
@@ -570,7 +539,7 @@ A command is the encapsulation of the front end's interaction with the server.
 All commands are DBI [[file:dbi.org::#statementStruct][Statements]]. For the most part they are unnamed. But they do need a name of somesort to say they are running.
 
 #+begin_src scheme :noweb-ref command struct
-(defstruct (postgresql-command statement) (conn complete input token)
+(defstruct (postgresql-command statement) (conn complete notices input token)
   constructor: :init!
   print: (complete))
 
@@ -579,7 +548,7 @@ All commands are DBI [[file:dbi.org::#statementStruct][Statements]]. For the mos
 
 (defmethod {:init! postgresql-command}
   (lambda (self conn name: (name unnamed-command) complete: (complete #f))
-    (struct-instance-init! self name conn complete)))
+    (struct-instance-init! self name conn complete [])))
 
 
 (defmethod {query-start postgresql-command} void)
@@ -588,7 +557,16 @@ All commands are DBI [[file:dbi.org::#statementStruct][Statements]]. For the mos
 (defmethod {query-row postgresql-command} postgresql-command-complete)
 (defmethod {columns postgresql-command} (lambda _ '()))
 #+end_src
+*** Notice Handler
 
+#+begin_src scheme :noweb-ref wrap-notice-handler
+(def (wrap-notice-handler cmd thunk)
+  (with-postgresql-notice-handler
+   (postgresql-command-conn cmd)
+   (lambda args
+     (push! args (postgresql-command-notices cmd)))
+   thunk))
+#+end_src
 *** Reset
 
 For some commands the db and driver are returning things even though we are done with them. Even if they are not, we want to be done with it.
@@ -616,7 +594,7 @@ The driver knows if we are still in this command, so we just say to reset it.
 (defmethod {:init! postgresql-statement}
   (lambda (self conn name: (name unnamed-command)
                 cols params: (params []))
-    (struct-instance-init! self name conn #f #f #f cols params)))
+    (struct-instance-init! self name conn #f [] #f #f cols params)))
 #+end_src
 
 
@@ -640,7 +618,6 @@ As are columns.
 And to ~-fini~'sh it up we just reset it
 
 #+begin_src scheme :noweb-ref statement query
-
 (defmethod {query-fini postgresql-statement}
    postgresql-statement::reset)
 #+end_src
@@ -694,10 +671,11 @@ set that and return it.
 #+begin_src scheme :noweb-ref Prepared Statement Methods
 (defmethod {exec postgresql-statement}
   (lambda (self)
-    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
-      (let (comp (postgresql-exec! conn name (or bind [])))
-        (begin0 comp
-          (set! (postgresql-command-complete self) comp))))))
+    (with ((postgresql-statement name conn _ _ _ _ _ _ bind) self)
+      (wrap-notice-handler self
+       (cut let (comp (postgresql-exec! conn name (or bind [])))
+                (begin0 comp
+                  (set! (postgresql-command-complete self) comp)))))))
 #+end_src
 
 *** Finalize: Close the prepared statement and reset
@@ -730,13 +708,14 @@ There are a few different types of statements. When one is fetched from a [[#fro
 
 (defmethod {query-start postgresql-statement}
   (lambda (self)
-    (unless (postgresql-statement-in-query? self)
-    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
-      (let ((values inp token) (postgresql-query! conn name (or bind [])))
-        (set! (postgresql-command-token self) token)
-        (set! (postgresql-command-input self) inp)
-        (set! (postgresql-statement-row self) #f))))))
-
+    (wrap-notice-handler
+     self
+     (cut unless (postgresql-statement-in-query? self)
+          (with ((postgresql-statement name conn _ _ _ _ _ _ bind) self)
+            (let ((values inp token) (postgresql-query! conn name (or bind [])))
+              (set! (postgresql-command-token self) token)
+              (set! (postgresql-command-input self) inp)
+              (set! (postgresql-statement-row self) #f)))))))
 #+end_src
 
 
@@ -804,8 +783,22 @@ There are a few different types of statements. When one is fetched from a [[#fro
 
 (defmethod {:init! postgresql-query}
   (lambda (self conn str greedy: (greedy #t))
-    (struct-instance-init! self unnamed-command conn #f #f #f str #f greedy)))
+    (struct-instance-init! self unnamed-command conn #f [] #f #f str #f greedy)))
 #+end_src
+
+*** Exec
+
+
+#+begin_src scheme :noweb-ref query query
+(defmethod {exec postgresql-query}
+  (lambda (self)
+    (postgresql-query::query-start self)
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ _ token str) self)
+          (postgresql-reset! conn token)))))
+
+#+end_src
+*** Iterate
 
 The [[file:dbi.org::#statementIter][Iterate]] procedure needs 4 methods.
 
@@ -825,10 +818,11 @@ To start is very simple.
 #+begin_src scheme :noweb-ref query query
 (defmethod {query-start postgresql-query}
   (lambda (self)
-    (with ((postgresql-query _ conn _ _ _ str) self)
-      (let ((values inp token) (postgresql-simple-query! conn str))
-        (set! (postgresql-command-token self) token)
-        (set! (postgresql-command-input self) inp)))))
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ _ _ str) self)
+          (let ((values inp token) (postgresql-simple-query! conn str))
+            (set! (postgresql-command-token self) token)
+            (set! (postgresql-command-input self) inp))))))
 #+end_src
 
 Fetching is slightly more complex. There are, ideally, only two objects that are looked at to return a single command from each fetch.
@@ -837,13 +831,15 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
     what is given to us.
   - RowDescription :: When there are rows we get this.
 
+On top of that there is the ~greedy~ option. This is where we make queryable statements from the output.
 
 
 #+begin_src scheme :noweb-ref query query
 (defmethod {query-fetch postgresql-query}
   (lambda (self)
     (def greedy-in #f)
-    (with ((postgresql-query _ conn _ inp token _ cmd greedy) self)
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ inp token _ cmd greedy) self)
       (if (not inp) iter-end
           (let again ()
              (let (next (channel-get inp))
@@ -860,7 +856,7 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
                  (again))
                 ((postgresql-CommandComplete? next)
                  (let ((comp (postgresql-message-args next)))
-                   (when (and cmd (not greedy-in))
+                   (when (and cmd (not greedy))
                      (set! (postgresql-command-input cmd) #f))
                    (when greedy-in
                      (channel-sync greedy-in next)
@@ -874,7 +870,7 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
                             (set! (postgresql-query-cmd self) #f)
                             (set! cmd #f)
                             (again))
-                         (else 
+                         (else
                           (void)))))
                 ((postgresql-RowDescription? next)
                  (let (stmt (make-postgresql-statement
@@ -890,7 +886,12 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
                           (again)))))
                 (else
                  (when greedy-in (channel-sync greedy-in next))
-                 (again)))))))))
+                 ;; (display "greed?: " )
+                 ;; (display greedy-in)
+                 ;; (display " cmd :" ) (display cmd)
+                 ;; (display " on  :" ) (display next)
+                 ;; (display "\n")
+                 (again))))))))))
 #+end_src
 
 
@@ -998,6 +999,9 @@ Fetching is slightly more complex. There are, ideally, only two objects that are
   (make-parameter default-catalog))
 #+end_src
 * The Backend Driver
+:PROPERTIES:
+:CUSTOM_ID: backEnd
+:END:
 
 #+begin_quote
 PostgreSQL uses a message-based protocol for communication between frontends and
@@ -1009,6 +1013,88 @@ any non-privileged port number can be used.
 
 That's the sense of it. We have a function that runs in a thread and implements
 the communication protocol. We interact with that protocol and bob's your uncle.
+
+** Notifications: ~NoticeResponse~
+
+The driver has a channel when collecting query results, but none at all when executing and/or not caring for the results.
+
+But, occaisionally, we want to collect them or otherwise notice them.
+
+#+begin_src scheme :noweb-ref NoticeResponse
+(def current-notice-handler
+  (make-parameter
+   (lambda (msg irritants)
+     (warnf "NoticeResponse: ~a ~a" msg irritants))))
+#+end_src
+
+Now, because this is a thread the dynamic environment does not quite work as expected
+
+#+begin_src scheme :noweb-ref postgresql-current-notice-handler
+(def (postgresql-current-notice-handler conn)
+  (alet (driver (get-driver conn))
+    (!!postgresql.current-notice-handler driver #f)))
+
+
+(def (postgresql-current-notice-handler-set! conn handler)
+  (alet (driver (get-driver conn))
+    (!!postgresql.current-notice-handler driver handler)))
+#+end_src
+
+That means we need our own version of parameterize.
+
+#+begin_src scheme :noweb-ref postgresql-current-notice-handler
+(def (with-postgresql-notice-handler conn handler thunk)
+  (let (pren (postgresql-current-notice-handler conn))
+    (try
+     (set! (postgresql-current-notice-handler conn)
+       (lambda args (apply handler args) (apply pren args)))
+     (thunk)
+     (finally
+      (set! (postgresql-current-notice-handler conn) pren)))))
+
+#+end_src
+
+
+
+
+** Prepared Statements
+
+Statements can be prepared ahead of time.
+
+*** ~query-pump~
+
+For a prepared statement the query pump is per command.
+
+#+begin_src scheme :noweb-ref query-pump
+(def (query-pump)
+    ;; Execute ("")          -> DataRow ...
+    ;;                          CommandComplete | EmptyQueryResponse
+    ;;                          | ErrorResponse | PortalSuspended.
+    ;; Sync                  -> ReadyForQuery
+    (let/cc break
+      (let lp ()
+        (match (recv!)
+          (['DataRow . cols]
+           (cond
+            ((channel-try-put query-output cols)
+             (lp))
+            (else
+             (channel-sync query-output cols query-token)
+             (break))))
+          (['CommandComplete tag]
+           (channel-sync query-output (void))
+           (channel-sync query-output (postgresql-CommandComplete tag))
+           (void))
+          ([(or 'PortalSuspended 'EmptyQueryResponse)]
+           (void))
+          (['ErrorResponse msg . irritants]
+           (channel-sync query-output (make-sql-error msg irritants 'postgresql-query!)))))
+      (channel-close query-output)
+      (set! query-output #f)
+      (set! query-token #f)
+      (resync!)))
+#+end_src
+
 
 ** ~postgresql-socket~: Sometimes we need to hack!
 
@@ -1048,7 +1134,7 @@ Connecting to the server and then spawning and returning the driver thread.
         (['ErrorResponse msg . irritants]
          (apply raise-io-error 'postgresql-connect! msg irritants))
         (['NoticeResponse msg . irritants]
-         (warnf "NOTICE: ~a ~a" msg irritants)
+         ((current-notice-handler) msg irritants)
          (lp))
         (else
          (lp)))))
@@ -1175,7 +1261,7 @@ We may need to continue with one of our pumps.
       (msg msg)))
 
   (def (notice! msg irritants)
-    (warnf "NOTICE: ~a ~a" msg irritants))
+    ((current-notice-handler) msg irritants))
 
   (def (resync!)
     (let lp ()
@@ -1296,7 +1382,7 @@ We may need to continue with one of our pumps.
   <<simple-query-pump>>
 
   <<continue>>
-  
+
   (def (close name)
     ;; Close (name) -> CloseComplete | ErrorResponse
     (if query-output
@@ -1341,12 +1427,13 @@ We may need to continue with one of our pumps.
         ((!postgresql.simple-query str k)
          (do-action k (simple-query-start str) (simple-query-pump)))
         ((!postgresql.continue token) (continue token))
-        ((!postgresql.reset token)
-          (maybe-sync!))
-        ((!postgresql.close name)
-         (close name))
-        ((!postgresql.shutdown)
-         (shutdown!))
+        ((!postgresql.reset token) (maybe-sync!))
+        ((!postgresql.close name) (close name))
+        ((!postgresql.shutdown) (shutdown!))
+        ((!postgresql.current-notice-handler proc k)
+         (do-action k (if proc
+           (current-notice-handler proc)
+           (current-notice-handler))))
         (bogus
          (warnf "unexpected message: ~a" bogus)))
     (loop))
@@ -1535,6 +1622,7 @@ the continuation token:
         :drewc/db/postgresql-driver
         :std/iter
         :std/misc/channel
+        :std/misc/list
         :std/srfi/19)
 (export postgresql-connect
         (struct-out postgresql-command
@@ -1548,6 +1636,8 @@ the continuation token:
 <<postgresql-connection>>
 
 <<command struct>>
+
+<<wrap-notice-handler>>
 
 <<command reset>>
 
@@ -1604,6 +1694,9 @@ the continuation token:
         postgresql-message-args
         postgresql-RowDescription?
         postgresql-CommandComplete?
+        postgresql-current-notice-handler
+        postgresql-current-notice-handler-set!
+        with-postgresql-notice-handler
         (rename: !token? query-token?))
 
 (deflogger postgres)
@@ -1614,6 +1707,7 @@ the continuation token:
   (exec name params)
   (query name params)
   (simple-query str)
+  (current-notice-handler proc)
   event:
   (continue token)
   (reset token)
@@ -1638,6 +1732,8 @@ the continuation token:
    (if (thread? conn) conn (connection-e conn))))
 
 <<postgresql-socket>>
+
+<<NoticeResponse>>
 
 #;(defrules DEBUG ()
   ((_ what arg ...)
@@ -1679,6 +1775,8 @@ the continuation token:
     (alet (driver (get-driver conn))
       (!!postgresql.reset driver token))
     (error "Bad argument; illegal query token" token)))
+
+<<postgresql-current-notice-handler>>
 
 (def (postgresql-close! conn)
   (alet (driver (get-driver conn))

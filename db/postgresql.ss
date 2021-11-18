@@ -6,6 +6,7 @@
         :drewc/db/postgresql-driver
         :std/iter
         :std/misc/channel
+        :std/misc/list
         :std/srfi/19)
 (export postgresql-connect
         (struct-out postgresql-command
@@ -37,7 +38,7 @@
   (lambda (self)
     (postgresql-close! self)))
 
-(defstruct (postgresql-command statement) (conn complete input token)
+(defstruct (postgresql-command statement) (conn complete notices input token)
   constructor: :init!
   print: (complete))
 
@@ -46,7 +47,7 @@
 
 (defmethod {:init! postgresql-command}
   (lambda (self conn name: (name unnamed-command) complete: (complete #f))
-    (struct-instance-init! self name conn complete)))
+    (struct-instance-init! self name conn complete [])))
 
 
 (defmethod {query-start postgresql-command} void)
@@ -54,6 +55,13 @@
 (defmethod {query-fetch postgresql-command} (lambda _ iter-end))
 (defmethod {query-row postgresql-command} postgresql-command-complete)
 (defmethod {columns postgresql-command} (lambda _ '()))
+
+(def (wrap-notice-handler cmd thunk)
+  (with-postgresql-notice-handler
+   (postgresql-command-conn cmd)
+   (lambda args
+     (push! args (postgresql-command-notices cmd)))
+   thunk))
 
 (defmethod {reset postgresql-command}
   (lambda (self)
@@ -69,7 +77,7 @@
 (defmethod {:init! postgresql-statement}
   (lambda (self conn name: (name unnamed-command)
                 cols params: (params []))
-    (struct-instance-init! self name conn #f #f #f cols params)))
+    (struct-instance-init! self name conn #f [] #f #f cols params)))
 
 (defmethod {query-row postgresql-statement}
   (lambda (self)
@@ -78,7 +86,6 @@
    (lambda (self)
      (map car (postgresql-statement-cols self))))
 
-
 (defmethod {query-fini postgresql-statement}
    postgresql-statement::reset)
 (def (postgresql-statement-in-query? stmt)
@@ -86,13 +93,14 @@
 
 (defmethod {query-start postgresql-statement}
   (lambda (self)
-    (unless (postgresql-statement-in-query? self)
-    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
-      (let ((values inp token) (postgresql-query! conn name (or bind [])))
-        (set! (postgresql-command-token self) token)
-        (set! (postgresql-command-input self) inp)
-        (set! (postgresql-statement-row self) #f))))))
-
+    (wrap-notice-handler
+     self
+     (cut unless (postgresql-statement-in-query? self)
+          (with ((postgresql-statement name conn _ _ _ _ _ _ bind) self)
+            (let ((values inp token) (postgresql-query! conn name (or bind [])))
+              (set! (postgresql-command-token self) token)
+              (set! (postgresql-command-input self) inp)
+              (set! (postgresql-statement-row self) #f)))))))
 (defmethod {query-fetch postgresql-statement}
   (lambda (self)
     (def (result->row cols)
@@ -170,10 +178,11 @@
     (set! (postgresql-statement-bind self) #f)))
 (defmethod {exec postgresql-statement}
   (lambda (self)
-    (with ((postgresql-statement name conn _ _ _ _ _ bind) self)
-      (let (comp (postgresql-exec! conn name (or bind [])))
-        (begin0 comp
-          (set! (postgresql-command-complete self) comp))))))
+    (with ((postgresql-statement name conn _ _ _ _ _ _ bind) self)
+      (wrap-notice-handler self
+       (cut let (comp (postgresql-exec! conn name (or bind [])))
+                (begin0 comp
+                  (set! (postgresql-command-complete self) comp)))))))
 (defmethod {finalize postgresql-statement}
   (lambda (self)
     (with ((postgresql-statement name conn) self)
@@ -192,19 +201,28 @@
 
 (defmethod {:init! postgresql-query}
   (lambda (self conn str greedy: (greedy #t))
-    (struct-instance-init! self unnamed-command conn #f #f #f str #f greedy)))
+    (struct-instance-init! self unnamed-command conn #f [] #f #f str #f greedy)))
+
+(defmethod {exec postgresql-query}
+  (lambda (self)
+    (postgresql-query::query-start self)
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ _ token str) self)
+          (postgresql-reset! conn token)))))
 
 (defmethod {query-row postgresql-query} postgresql-query-cmd)
 (defmethod {query-start postgresql-query}
   (lambda (self)
-    (with ((postgresql-query _ conn _ _ _ str) self)
-      (let ((values inp token) (postgresql-simple-query! conn str))
-        (set! (postgresql-command-token self) token)
-        (set! (postgresql-command-input self) inp)))))
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ _ _ str) self)
+          (let ((values inp token) (postgresql-simple-query! conn str))
+            (set! (postgresql-command-token self) token)
+            (set! (postgresql-command-input self) inp))))))
 (defmethod {query-fetch postgresql-query}
   (lambda (self)
     (def greedy-in #f)
-    (with ((postgresql-query _ conn _ inp token _ cmd greedy) self)
+    (wrap-notice-handler self
+     (cut with ((postgresql-query _ conn _ _ inp token _ cmd greedy) self)
       (if (not inp) iter-end
           (let again ()
              (let (next (channel-get inp))
@@ -221,7 +239,7 @@
                  (again))
                 ((postgresql-CommandComplete? next)
                  (let ((comp (postgresql-message-args next)))
-                   (when (and cmd (not greedy-in))
+                   (when (and cmd (not greedy))
                      (set! (postgresql-command-input cmd) #f))
                    (when greedy-in
                      (channel-sync greedy-in next)
@@ -235,7 +253,7 @@
                             (set! (postgresql-query-cmd self) #f)
                             (set! cmd #f)
                             (again))
-                         (else 
+                         (else
                           (void)))))
                 ((postgresql-RowDescription? next)
                  (let (stmt (make-postgresql-statement
@@ -251,7 +269,12 @@
                           (again)))))
                 (else
                  (when greedy-in (channel-sync greedy-in next))
-                 (again)))))))))
+                 ;; (display "greed?: " )
+                 ;; (display greedy-in)
+                 ;; (display " cmd :" ) (display cmd)
+                 ;; (display " on  :" ) (display next)
+                 ;; (display "\n")
+                 (again))))))))))
 
 ;;; catalog/pg_type.h
 (defstruct catalog (s d)

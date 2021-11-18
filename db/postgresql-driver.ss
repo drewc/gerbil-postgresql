@@ -33,6 +33,9 @@
         postgresql-message-args
         postgresql-RowDescription?
         postgresql-CommandComplete?
+        postgresql-current-notice-handler
+        postgresql-current-notice-handler-set!
+        with-postgresql-notice-handler
         (rename: !token? query-token?))
 
 (deflogger postgres)
@@ -43,6 +46,7 @@
   (exec name params)
   (query name params)
   (simple-query str)
+  (current-notice-handler proc)
   event:
   (continue token)
   (reset token)
@@ -80,6 +84,11 @@
    (if (thread? conn) conn (connection-e conn))))
 
 (def postgresql-socket thread-specific)
+
+(def current-notice-handler
+  (make-parameter
+   (lambda (msg irritants)
+     (warnf "NoticeResponse: ~a ~a" msg irritants))))
 
 #;(defrules DEBUG ()
   ((_ what arg ...)
@@ -124,6 +133,24 @@
       (!!postgresql.reset driver token))
     (error "Bad argument; illegal query token" token)))
 
+(def (postgresql-current-notice-handler conn)
+  (alet (driver (get-driver conn))
+    (!!postgresql.current-notice-handler driver #f)))
+
+
+(def (postgresql-current-notice-handler-set! conn handler)
+  (alet (driver (get-driver conn))
+    (!!postgresql.current-notice-handler driver handler)))
+(def (with-postgresql-notice-handler conn handler thunk)
+  (let (pren (postgresql-current-notice-handler conn))
+    (try
+     (set! (postgresql-current-notice-handler conn)
+       (lambda args (apply handler args) (apply pren args)))
+     (thunk)
+     (finally
+      (set! (postgresql-current-notice-handler conn) pren)))))
+
+
 (def (postgresql-close! conn)
   (alet (driver (get-driver conn))
     (!!postgresql.shutdown driver)))
@@ -147,7 +174,7 @@
         (['ErrorResponse msg . irritants]
          (apply raise-io-error 'postgresql-connect! msg irritants))
         (['NoticeResponse msg . irritants]
-         (warnf "NOTICE: ~a ~a" msg irritants)
+         ((current-notice-handler) msg irritants)
          (lp))
         (else
          (lp)))))
@@ -249,7 +276,7 @@
       (msg msg)))
 
   (def (notice! msg irritants)
-    (warnf "NOTICE: ~a ~a" msg irritants))
+    ((current-notice-handler) msg irritants))
 
   (def (resync!)
     (let lp ()
@@ -442,7 +469,7 @@
       (if simple-query
         (simple-query-pump)
         (query-pump))))
-  
+
   (def (close name)
     ;; Close (name) -> CloseComplete | ErrorResponse
     (if query-output
@@ -487,12 +514,13 @@
         ((!postgresql.simple-query str k)
          (do-action k (simple-query-start str) (simple-query-pump)))
         ((!postgresql.continue token) (continue token))
-        ((!postgresql.reset token)
-          (maybe-sync!))
-        ((!postgresql.close name)
-         (close name))
-        ((!postgresql.shutdown)
-         (shutdown!))
+        ((!postgresql.reset token) (maybe-sync!))
+        ((!postgresql.close name) (close name))
+        ((!postgresql.shutdown) (shutdown!))
+        ((!postgresql.current-notice-handler proc k)
+         (do-action k (if proc
+           (current-notice-handler proc)
+           (current-notice-handler))))
         (bogus
          (warnf "unexpected message: ~a" bogus)))
     (loop))
