@@ -50,12 +50,11 @@
   sql-close)
 
 (defstruct statement (e))
+
 (defstruct (sql-error <error>) ())
 
 (def (raise-sql-error where what . irritants)
   (raise (make-sql-error what irritants where)))
-
-
 
 (def (sql-txn-do conn sql getf setf)
   (with ((connection e) conn)

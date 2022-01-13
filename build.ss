@@ -5,4 +5,5 @@
 
 (defbuild-script
   '("db/postgresql-driver" "db/postgresql" "db/dbi"
-    "db/postgresql-test" "db/postgresql-upstream-test"))
+    "db/postgresql-test" "db/postgresql-upstream-test"
+    "pg/pgpass" "pg/connect"))

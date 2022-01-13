@@ -15,7 +15,8 @@
 
 (defbuild-script
   '("db/postgresql-driver" "db/postgresql" "db/dbi"
-    "db/postgresql-test" "db/postgresql-upstream-test"))
+    "db/postgresql-test" "db/postgresql-upstream-test"
+    "pg/pgpass" "pg/connect"))
 
 #+end_src
 
@@ -54,4 +55,23 @@ git subtree add --prefix db ../gerbil/ pgdb-subtree --squash
 #+begin_src shell
 cd ~/me/src/gerbil-postgresql
 git subtree pull --prefix db ../gerbil/ pgdb-subtree --squash
+#+end_src
+
+** Push the subtree
+
+If we have changes we want upstream, this is where to go.
+
+#+begin_src shell
+cd ~/me/src/gerbil-postgresql
+cp db/postgresql*.ss ../gerbil/src/std/db/
+cd ../gerbil/src/std/db
+
+grep -irl "drewc/db" * | xargs sed -i 's/drewc\/db/std\/db/g'
+rm -f postgresql-upstream-test.ss postgresql.org
+git add postgresql*
+CHERRY=$(git rev-parse --short HEAD)
+
+git checkout master
+git subtree pull --prefix=src/std/db pgdb-subtree
+
 #+end_src

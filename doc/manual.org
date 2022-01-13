@@ -250,6 +250,8 @@ which can also be queried
 
 ** Not greedy? Throw away the results.
 
+There
+
 
 
 ** ~postgresql-command~
@@ -269,7 +271,7 @@ which can also be queried
     (let lp ((i 0))
       (let (next (channel-get inp))
         (cond
-         ((or (eof-object? next) (void? next)) i)
+         ((or (eof-object? next) (postgresql-CommandComplete? next)) i)
          ((query-token? next)
           (postgresql-continue! pg next)
           (lp i))
@@ -282,7 +284,7 @@ which can also be queried
     (let lp ((r []))
       (let (next (channel-get inp))
         (cond
-         ((or (void? next) (eof-object? next))
+         ((or (postgresql-CommandComplete? next) (eof-object? next))
           (reverse r))
          ((query-token? next)
           (postgresql-continue! pg next)
@@ -332,8 +334,6 @@ which can also be queried
 (check (postgresql-exec! pg "stmt0" [])
        => "DROP TABLE")
 (postgresql-close! pg)
-
-
 #+end_src
 
 * Testing

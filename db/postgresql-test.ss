@@ -34,7 +34,7 @@
           (let lp ((i 0))
             (let (next (channel-get inp))
               (cond
-               ((or (eof-object? next) (void? next)) i)
+               ((or (eof-object? next) (postgresql-CommandComplete? next)) i)
                ((query-token? next)
                 (postgresql-continue! pg next)
                 (lp i))
@@ -47,7 +47,7 @@
           (let lp ((r []))
             (let (next (channel-get inp))
               (cond
-               ((or (void? next) (eof-object? next))
+               ((or (postgresql-CommandComplete? next) (eof-object? next))
                 (reverse r))
                ((query-token? next)
                 (postgresql-continue! pg next)
@@ -96,9 +96,7 @@
              => 2001)
       (check (postgresql-exec! pg "stmt0" [])
              => "DROP TABLE")
-      (postgresql-close! pg)
-      
-      )
+      (postgresql-close! pg))
     (test-case "test: postgresql Generic DBI"
       (def db (sql-connect postgresql-connect
                            host: "localhost"
@@ -201,11 +199,4 @@
            (check (car sel3) => "SELECT 1")
            (check (cadr sel3) => '(("count" . 2)))
            (check (car drop2) => "DROP TABLE")
-           (check (cdr drop2) ? null?))))
-      
-      
-      
-      
-      
-      
-      )))
+           (check (cdr drop2) ? null?)))))))

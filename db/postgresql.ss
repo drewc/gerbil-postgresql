@@ -1,5 +1,5 @@
 ;;; -*- Gerbil -*-
-;;; (C) drewc, vyzo
+;;; (C) vyzo, drewc
 ;;; PostgreSQL dbi interface
 
 (import :drewc/db/dbi
@@ -73,7 +73,9 @@
 (defstruct (postgresql-statement postgresql-command) (cols params bind row)
   constructor: :init!
   final: #t)
+
 (defalias postgresql-statement-name statement-e)
+
 (defmethod {:init! postgresql-statement}
   (lambda (self conn name: (name unnamed-command)
                 cols params: (params []))
@@ -82,12 +84,14 @@
 (defmethod {query-row postgresql-statement}
   (lambda (self)
     (postgresql-statement-row self)))
+
 (defmethod {columns postgresql-statement}
    (lambda (self)
      (map car (postgresql-statement-cols self))))
 
 (defmethod {query-fini postgresql-statement}
    postgresql-statement::reset)
+
 (def (postgresql-statement-in-query? stmt)
   (!unnamed? (statement-e stmt)))
 
@@ -101,6 +105,7 @@
               (set! (postgresql-command-token self) token)
               (set! (postgresql-command-input self) inp)
               (set! (postgresql-statement-row self) #f)))))))
+
 (defmethod {query-fetch postgresql-statement}
   (lambda (self)
     (def (result->row cols)
@@ -129,11 +134,10 @@
            (let again ()
              (let (next (channel-get inp))
                (cond
-                ((or (eof-object? next) (void? next))
-                 (when (void? next)
-                   (let ((next (channel-get inp)))
+                ((or (eof-object? next) (postgresql-CommandComplete? next))
+                 (when (postgresql-CommandComplete? next)
                      (set! (postgresql-command-complete self)
-                       (postgresql-message-args next))))
+                       (postgresql-message-args next)))
                  (set! (postgresql-command-token self) #f)
                  (set! (postgresql-command-input self) #f)
                  (set! (postgresql-statement-row self) #f)
@@ -155,6 +159,7 @@
            ((values params cols)
             (postgresql-prepare-statement! self name sql)))
       (make-postgresql-statement self name: name cols params: params))))
+
 (defmethod {bind postgresql-statement}
   (lambda (self . args)
     (def (value->binding type-oid arg)
@@ -173,9 +178,11 @@
            (bind (map value->binding params args)))
       (set! (postgresql-statement-bind self) bind)
       (void))))
+
 (defmethod {clear postgresql-statement}
   (lambda (self)
     (set! (postgresql-statement-bind self) #f)))
+
 (defmethod {exec postgresql-statement}
   (lambda (self)
     (with ((postgresql-statement name conn _ _ _ _ _ _ bind) self)
@@ -189,6 +196,7 @@
       (postgresql-statement::reset self)
       (set! (postgresql-command-complete self) #f)
       (postgresql-close-statement! conn name))))
+
 (defmethod {reset postgresql-statement}
   (lambda (self)
     (postgresql-command::reset self)
@@ -211,6 +219,7 @@
           (postgresql-reset! conn token)))))
 
 (defmethod {query-row postgresql-query} postgresql-query-cmd)
+
 (defmethod {query-start postgresql-query}
   (lambda (self)
     (wrap-notice-handler self
@@ -218,6 +227,7 @@
           (let ((values inp token) (postgresql-simple-query! conn str))
             (set! (postgresql-command-token self) token)
             (set! (postgresql-command-input self) inp))))))
+
 (defmethod {query-fetch postgresql-query}
   (lambda (self)
     (def greedy-in #f)
@@ -269,11 +279,6 @@
                           (again)))))
                 (else
                  (when greedy-in (channel-sync greedy-in next))
-                 ;; (display "greed?: " )
-                 ;; (display greedy-in)
-                 ;; (display " cmd :" ) (display cmd)
-                 ;; (display " on  :" ) (display next)
-                 ;; (display "\n")
                  (again))))))))))
 
 ;;; catalog/pg_type.h

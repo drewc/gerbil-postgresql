@@ -1,5 +1,5 @@
 ;;; -*- Gerbil -*-
-;;; (C) vyzo
+;;; (C) vyzo, drew
 ;;; PostgreSQL driver
 
 (import :gerbil/gambit/threads
@@ -55,12 +55,14 @@
 
 (defstruct postgresql-message (name args)
   print: (args))
+
 (defstruct (postgresql-RowDescription postgresql-message) ()
   constructor: :init!
   final: #t)
 (defmethod {:init! postgresql-RowDescription}
   (lambda (self desc)
     (struct-instance-init! self 'RowDescription desc)))
+
 (defstruct (postgresql-CommandComplete postgresql-message) ()
   constructor: :init!
   final: #t)
@@ -273,6 +275,9 @@
       (['NoticeResponse msg . irritants]
        (notice! msg irritants)
        (recv!))
+      (['ParameterStatus msg . irritants]
+       (void)
+       (recv!))
       (msg msg)))
 
   (def (notice! msg irritants)
@@ -406,7 +411,6 @@
                (channel-sync query-output cols query-token)
                (break))))
             (['CommandComplete tag]
-             (channel-sync query-output (void))
              (channel-sync query-output (postgresql-CommandComplete tag))
              (void))
             ([(or 'PortalSuspended 'EmptyQueryResponse)]
@@ -428,7 +432,6 @@
            (set! simple-query #t)
            (values ch token)))
 
-  (def inside-rows #f)
   (def (simple-query-pump)
     (let/cc break
         (let lp ()
@@ -436,12 +439,8 @@
             (match r
               (['RowDescription . fields]
                (channel-sync query-output (postgresql-RowDescription fields))
-               (set! inside-rows query-token)
                (lp))
               (['CommandComplete tag]
-               (when (eq? inside-rows query-token)
-                 (channel-sync query-output (void))
-                 (set! inside-rows #f))
                (channel-sync query-output (postgresql-CommandComplete tag))
                (lp))
               (['DataRow . cols]
@@ -461,8 +460,7 @@
       (channel-close query-output)
       (set! query-output #f)
       (set! query-token #f)
-      (set! simple-query #f)
-      (set! inside-rows #f))
+      (set! simple-query #f))
 
   (def (continue token)
     (when (eq? token query-token)

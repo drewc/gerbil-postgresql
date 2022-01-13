@@ -116,12 +116,11 @@ results. How/where they come to us is a mystery that simplicity solves.
 <<defstruct connection>>
 
 <<define statement>>
+
 (defstruct (sql-error <error>) ())
 
 (def (raise-sql-error where what . irritants)
   (raise (make-sql-error what irritants where)))
-
-
 
 (def (sql-txn-do conn sql getf setf)
   (with ((connection e) conn)

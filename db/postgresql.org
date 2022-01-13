@@ -240,12 +240,14 @@ We do not really care about the results beyond passing them up to those that do.
 #+begin_src scheme :noweb-ref postgresql-message
 (defstruct postgresql-message (name args)
   print: (args))
+
 (defstruct (postgresql-RowDescription postgresql-message) ()
   constructor: :init!
   final: #t)
 (defmethod {:init! postgresql-RowDescription}
   (lambda (self desc)
     (struct-instance-init! self 'RowDescription desc)))
+
 (defstruct (postgresql-CommandComplete postgresql-message) ()
   constructor: :init!
   final: #t)
@@ -268,7 +270,6 @@ We do this by setting "inside rows" to the token when a RowDescription comes.
 If the inside-rows is also the query-token we are currently inside a "statement".
 
 #+begin_src scheme :noweb-ref simple-query-pump
-(def inside-rows #f)
 (def (simple-query-pump)
   (let/cc break
       (let lp ()
@@ -276,12 +277,8 @@ If the inside-rows is also the query-token we are currently inside a "statement"
           (match r
             (['RowDescription . fields]
              (channel-sync query-output (postgresql-RowDescription fields))
-             (set! inside-rows query-token)
              (lp))
             (['CommandComplete tag]
-             (when (eq? inside-rows query-token)
-               (channel-sync query-output (void))
-               (set! inside-rows #f))
              (channel-sync query-output (postgresql-CommandComplete tag))
              (lp))
             (['DataRow . cols]
@@ -301,8 +298,7 @@ If the inside-rows is also the query-token we are currently inside a "statement"
     (channel-close query-output)
     (set! query-output #f)
     (set! query-token #f)
-    (set! simple-query #f)
-    (set! inside-rows #f))
+    (set! simple-query #f))
 #+end_src
 
 *** Test out the pump
@@ -528,6 +524,7 @@ The driver takes care of what we need so in reality all we do is provide a name 
            ((values params cols)
             (postgresql-prepare-statement! self name sql)))
       (make-postgresql-statement self name: name cols params: params))))
+
 #+end_src
 ** Command
 :PROPERTIES:
@@ -590,7 +587,9 @@ The driver knows if we are still in this command, so we just say to reset it.
 (defstruct (postgresql-statement postgresql-command) (cols params bind row)
   constructor: :init!
   final: #t)
+
 (defalias postgresql-statement-name statement-e)
+
 (defmethod {:init! postgresql-statement}
   (lambda (self conn name: (name unnamed-command)
                 cols params: (params []))
@@ -604,6 +603,7 @@ A row is easy.
 (defmethod {query-row postgresql-statement}
   (lambda (self)
     (postgresql-statement-row self)))
+
 #+end_src
 
 As are columns.
@@ -620,6 +620,7 @@ And to ~-fini~'sh it up we just reset it
 #+begin_src scheme :noweb-ref statement query
 (defmethod {query-fini postgresql-statement}
    postgresql-statement::reset)
+
 #+end_src
 
 ** Prepared statements
@@ -651,6 +652,7 @@ For binding a statement we simply serialize the args of the statement. That way 
            (bind (map value->binding params args)))
       (set! (postgresql-statement-bind self) bind)
       (void))))
+
 #+end_src
 
 **** Clear binding
@@ -659,6 +661,7 @@ For binding a statement we simply serialize the args of the statement. That way 
 (defmethod {clear postgresql-statement}
   (lambda (self)
     (set! (postgresql-statement-bind self) #f)))
+
 #+end_src
 
 *** Exec
@@ -687,6 +690,7 @@ set that and return it.
       (postgresql-statement::reset self)
       (set! (postgresql-command-complete self) #f)
       (postgresql-close-statement! conn name))))
+
 #+end_src
 
 ** Reset statement
@@ -716,6 +720,7 @@ There are a few different types of statements. When one is fetched from a [[#fro
               (set! (postgresql-command-token self) token)
               (set! (postgresql-command-input self) inp)
               (set! (postgresql-statement-row self) #f)))))))
+
 #+end_src
 
 
@@ -748,11 +753,10 @@ There are a few different types of statements. When one is fetched from a [[#fro
            (let again ()
              (let (next (channel-get inp))
                (cond
-                ((or (eof-object? next) (void? next))
-                 (when (void? next)
-                   (let ((next (channel-get inp)))
+                ((or (eof-object? next) (postgresql-CommandComplete? next))
+                 (when (postgresql-CommandComplete? next)
                      (set! (postgresql-command-complete self)
-                       (postgresql-message-args next))))
+                       (postgresql-message-args next)))
                  (set! (postgresql-command-token self) #f)
                  (set! (postgresql-command-input self) #f)
                  (set! (postgresql-statement-row self) #f)
@@ -811,6 +815,7 @@ A row is just the last command fetched.
 
 #+begin_src scheme :noweb-ref query query
 (defmethod {query-row postgresql-query} postgresql-query-cmd)
+
 #+end_src
 
 To start is very simple.
@@ -823,6 +828,7 @@ To start is very simple.
           (let ((values inp token) (postgresql-simple-query! conn str))
             (set! (postgresql-command-token self) token)
             (set! (postgresql-command-input self) inp))))))
+
 #+end_src
 
 Fetching is slightly more complex. There are, ideally, only two objects that are looked at to return a single command from each fetch.
@@ -886,11 +892,6 @@ On top of that there is the ~greedy~ option. This is where we make queryable sta
                           (again)))))
                 (else
                  (when greedy-in (channel-sync greedy-in next))
-                 ;; (display "greed?: " )
-                 ;; (display greedy-in)
-                 ;; (display " cmd :" ) (display cmd)
-                 ;; (display " on  :" ) (display next)
-                 ;; (display "\n")
                  (again))))))))))
 #+end_src
 
@@ -1082,7 +1083,6 @@ For a prepared statement the query pump is per command.
              (channel-sync query-output cols query-token)
              (break))))
           (['CommandComplete tag]
-           (channel-sync query-output (void))
            (channel-sync query-output (postgresql-CommandComplete tag))
            (void))
           ([(or 'PortalSuspended 'EmptyQueryResponse)]
@@ -1615,7 +1615,7 @@ the continuation token:
 
 #+begin_src scheme :tangle postgresql.ss :noweb yes
 ;;; -*- Gerbil -*-
-;;; (C) drewc, vyzo
+;;; (C) vyzo, drewc
 ;;; PostgreSQL dbi interface
 
 (import :drewc/db/dbi
@@ -1660,7 +1660,7 @@ the continuation token:
 
 #+begin_src scheme :tangle postgresql-driver.ss :noweb yes
 ;;; -*- Gerbil -*-
-;;; (C) vyzo
+;;; (C) vyzo, drew
 ;;; PostgreSQL driver
 
 (import :gerbil/gambit/threads

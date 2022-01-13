@@ -6,7 +6,8 @@
 We use gerbil, gerbil has a postgresql dbi. We interact with
 postgresql and gerbil.
 
-* Usage 
+
+* Usage
 
 We want to connect to a database. We want to use an external file to
 store password information.  Pgpass to the rescue! [[file:doc/pgpass.org][See here for
@@ -29,6 +30,8 @@ automated. [[file:doc/connect.org][~connect~]] , using pgass!
   ;; => #<postgresql-connection #30>
 #+END_SRC
 
+* Literate Program
 
+This is a literate program[fn:lp].
 
-
+ - ~./db/postgresql*~ :: The code for the driver and frontend are really in [[file:db/postgresql.org][db/postgresql.org]].
